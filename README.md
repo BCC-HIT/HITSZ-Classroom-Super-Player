@@ -2,7 +2,7 @@
 
 > **专为 HITSZ 教学视频平台定制的“沉浸式”双流播放增强工具。**
 
-[![Install on GreasyFork](https://img.shields.io/badge/Install-GreasyFork-green.svg)](https://greasyfork.org/zh-CN/scripts/你的脚本ID) [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Install on GreasyFork](https://img.shields.io/badge/Install-GreasyFork-green.svg)](https://greasyfork.org/zh-CN/scripts/559935-hitsz-%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8) [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## 📖 简介 (Introduction)
 
@@ -72,5 +72,5 @@
 
 ---
 
-**Author:** [BCC](https://github.com/你的Github用户名)  
+**Author:** [BCC](https://github.com/BCC-HIT)  
 **License:** MIT
