@@ -14,8 +14,8 @@
 
 如果 GreasyFork 无法访问，请尝试 OpenUserJS 镜像站点。
 
-* **[推荐] GreasyFork 下载**: [点击安装]((https://greasyfork.org/zh-CN/scripts/559935-hitsz-%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8)
-* **[镜像] OpenUserJS 网站**: [点击安装](https://openuserjs.org/scripts/BCC-HIT/HITSZ_%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8))
+* **[推荐] GreasyFork 下载**: [点击安装](https://greasyfork.org/zh-CN/scripts/559935-hitsz-%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8)
+* **[镜像] OpenUserJS 网站**: [点击安装](https://openuserjs.org/scripts/BCC-HIT/HITSZ_%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8)
 * **[直接安装] GitHub 原始代码**: [直接安装](https://github.com/BCC-HIT/HITSZ-Classroom-Super-Player/blob/main/HITSZ-Classroom-Super-Player.user.js)
 
 ---
