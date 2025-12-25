@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HITSZ 课堂视频超级播放器
 // @namespace    http://tampermonkey.net/
-// @version      21.3
+// @version      21.4
 // @description  HITSZ 视频平台功能增强脚本。现代化UI，进度条拖动精准流畅。支持画中画（老师与课件同时显示），可调整大小比例，去黑边。支持两通道音量在0-500%独立调节，支持人声增强。
 // @author       BCC
 // @match        *://jxypt.hitsz.edu.cn/ve/back/rp/common/rpIndex.shtml?method=studyCourseDeatil*
@@ -353,7 +353,7 @@
                                 <li><b>独立音量</b> 两个滑块分别绑定视频源1和源2</li>
                                 <li><b>滚轮调音</b> 鼠标在主画面空白处滚动，快速调节主音量</li>
                                 <li><b>人声增强</b> 默认开启 5dB，集成高频降噪与动态压缩</li>
-                                <li><b>同步微调</b> 0.0s 精度微调，解决音画不同步</li>
+                                <li><b>视角对齐</b> 0.0s 精度微调，解决主副画面不同步</li>
                             </ul>
                         </div>
                         <div class="help-item">
@@ -390,10 +390,10 @@
 
                 <div class="ctrl-grp">
                     <div class="ctrl-header">
-                        <span>同步微调</span>
+                        <span>视角对齐</span>
                         <div style="display:flex;align-items:center;height:14px;"><input id="sync-input" class="sync-input" value="0.0"><span class="sync-unit">s</span></div>
                     </div>
-                    <input type="range" id="sync-slider" min="-5" max="5" step="0.1" value="0">
+                    <input type="range" id="sync-slider" min="-60" max="60" step="0.1" value="0">
                 </div>
 
                 <div class="ctrl-grp">
