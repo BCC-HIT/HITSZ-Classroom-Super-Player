@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         HITSZ 课堂视频超级播放器
 // @namespace    http://tampermonkey.net/
-// @version      21.4
-// @description  HITSZ 视频平台功能增强脚本。现代化UI，进度条拖动精准流畅。支持画中画（老师与课件同时显示），可调整大小比例，去黑边。支持两通道音量在0-500%独立调节，支持人声增强。
+// @version      32.0
+// @description  【仅支持 Violentmonkey 暴力猴，不支持 Tampermonkey 油猴】HITSZ 视频平台功能增强脚本。现代化UI，进度条拖动精准流畅。支持画中画（老师与课件同时显示），可调整大小比例，去黑边。支持两通道音量在0-500%独立调节，支持人声增强。
 // @author       BCC
 // @match        *://jxypt.hitsz.edu.cn/ve/back/rp/common/rpIndex.shtml?method=studyCourseDeatil*
 // @match        *://jxypt-hitsz-edu-cn-s.hitsz.edu.cn/ve/back/rp/common/rpIndex.shtml?method=studyCourseDeatil*
+// @updateURL    https://openuserjs.org/meta/BCC-HIT/HITSZ_%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8.meta.js
+// @downloadURL  https://openuserjs.org/install/BCC-HIT/HITSZ_%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8.user.js
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.4.0/dist/hls.min.js
 // @grant        unsafeWindow
 // @license      MIT
@@ -16,6 +18,7 @@
     'use strict';
 
     const capturedUrls = new Set();
+
     let isPlayerLaunched = false;
     let videoMeta = { title: '未知课程', teacher: '未知教师', date: '' };
 
@@ -38,7 +41,7 @@
     let audioCtx;
     const nodes = { v1: null, v2: null };
 
-    console.log("HSP V21.3 (Author: BCC): 引擎启动...");
+    console.log("HSP V30.0 (Author: BCC): 引擎启动...");
 
     // 0. 信息抓取
     function scrapePageInfo() {
@@ -79,80 +82,262 @@
 
     const originalOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {
-        if (isValidStream(url)) { capturedUrls.add(url); tryLaunch(); }
+        if (isValidStream(url)) {
+            capturedUrls.add(url);
+            document.querySelectorAll('video:not(#hsp-v1):not(#hsp-v2)').forEach(v => { v.muted = true; v.volume = 0; });
+            tryLaunch();
+        }
+
+
         return originalOpen.apply(this, arguments);
     };
 
     const originalFetch = window.fetch;
     window.fetch = function(url, options) {
-        if (isValidStream(url)) { capturedUrls.add(url); tryLaunch(); }
+        if (isValidStream(url)) {
+            capturedUrls.add(url);
+            document.querySelectorAll('video:not(#hsp-v1):not(#hsp-v2)').forEach(v => { v.muted = true; v.volume = 0; });
+            tryLaunch();
+        }
         return originalFetch.apply(this, arguments);
     };
 
     let launchTimer;
+    let launchScheduled = false; // 修复：防止延迟窗口内重复排期
     function tryLaunch() {
-        if (isPlayerLaunched) return;
-        clearTimeout(launchTimer);
+        if (isPlayerLaunched || launchScheduled) return;
+        launchScheduled = true; // 立刻锁住，后续XHR/fetch不再重置计时器
         launchTimer = setTimeout(() => {
-            const validList = Array.from(capturedUrls).filter(isValidStream);
+            // 修复：严格限制最多取前两条，防止HLS子manifest被误当第二路流
+            const validList = Array.from(capturedUrls).filter(isValidStream).slice(0, 2);
             if (validList.length > 0) {
+                isPlayerLaunched = true; // 修复：在任何异步操作前先锁住，防止race condition
                 parseMetaFromUrl(validList[0]);
-                isPlayerLaunched = true;
                 renderUI(validList);
+            } else {
+                // 没拿到流则重置，允许下次重试
+                launchScheduled = false;
             }
         }, 1200);
     }
 
     // 2. 音频引擎
     function setupAudioNode(videoEl, id) {
-        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (nodes[id]) return nodes[id];
+        try {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioCtx.createMediaElementSource(videoEl);
+            const gain = audioCtx.createGain();
+            const lowpass = audioCtx.createBiquadFilter();
+            const highpass = audioCtx.createBiquadFilter();
+            const highshelf = audioCtx.createBiquadFilter();
+            const peaking = audioCtx.createBiquadFilter();
+            const compressor = audioCtx.createDynamicsCompressor();
 
-        const source = audioCtx.createMediaElementSource(videoEl);
-        const gain = audioCtx.createGain();
-        const lowpass = audioCtx.createBiquadFilter();
-        const highpass = audioCtx.createBiquadFilter();
-        const highshelf = audioCtx.createBiquadFilter();
-        const peaking = audioCtx.createBiquadFilter();
-        const compressor = audioCtx.createDynamicsCompressor();
+            highpass.type = 'highpass'; highpass.frequency.value = 80;
+            lowpass.type = 'lowpass'; lowpass.frequency.value = 22000;
+            highshelf.type = 'highshelf'; highshelf.frequency.value = 4000; highshelf.gain.value = 0;
+            peaking.type = 'peaking'; peaking.frequency.value = 2000; peaking.Q.value = 0.8; peaking.gain.value = 0;
+            compressor.threshold.value = -10; compressor.ratio.value = 10;
 
-        highpass.type = 'highpass'; highpass.frequency.value = 80;
-        lowpass.type = 'lowpass'; lowpass.frequency.value = 22000;
-        highshelf.type = 'highshelf'; highshelf.frequency.value = 4000; highshelf.gain.value = 0;
-        peaking.type = 'peaking'; peaking.frequency.value = 2000; peaking.Q.value = 0.8; peaking.gain.value = 0;
-        compressor.threshold.value = -10; compressor.ratio.value = 10;
+            const analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 4096; // 足够精度的时域数据
 
-        source.connect(highpass); highpass.connect(lowpass); lowpass.connect(highshelf);
-        highshelf.connect(peaking); peaking.connect(compressor); compressor.connect(gain);
-        gain.connect(audioCtx.destination);
+            source.connect(analyser); analyser.connect(highpass); highpass.connect(lowpass); lowpass.connect(highshelf);
+            highshelf.connect(peaking); peaking.connect(compressor); compressor.connect(gain);
+            gain.connect(audioCtx.destination);
 
-        nodes[id] = { gain, lowpass, highpass, highshelf, peaking, compressor };
+            nodes[id] = { gain, lowpass, highpass, highshelf, peaking, compressor, analyser };
+        } catch(e) {
+            // Web Audio Graph 建立失败（如AudioContext被抢占），降级为直接用video.volume
+            console.warn('[HSP] Web Audio fallback for', id, e);
+            nodes[id] = null; // 保持null，updateAudioState会用video.volume兜底
+        }
         return nodes[id];
     }
 
     function updateAudioState(v1, v2) {
-        if (!audioCtx) return;
-        if (audioCtx.state === 'suspended') audioCtx.resume();
-
-        if (nodes.v1) { v1.volume = 1; nodes.v1.gain.gain.value = state.vol1; }
-        if (nodes.v2) { v2.volume = 1; nodes.v2.gain.gain.value = state.vol2; }
-
-        [nodes.v1, nodes.v2].forEach(n => {
-            if (!n) return;
-            if (state.vocalGain > 0) {
-                n.peaking.gain.value = state.vocalGain;
-                n.highshelf.gain.value = Math.max(-20, -1 * state.vocalGain);
-                n.lowpass.frequency.value = 10000;
-            } else {
-                n.peaking.gain.value = 0;
-                n.highshelf.gain.value = 0;
-                n.lowpass.frequency.value = 22000;
-            }
-        });
+        // Web Audio Graph路径
+        if (audioCtx) {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            if (nodes.v1) { v1.volume = 1; nodes.v1.gain.gain.value = state.vol1; }
+            if (nodes.v2) { v2.volume = 1; nodes.v2.gain.gain.value = state.vol2; }
+            [nodes.v1, nodes.v2].forEach(n => {
+                if (!n) return;
+                if (state.vocalGain > 0) {
+                    n.peaking.gain.value = state.vocalGain;
+                    n.highshelf.gain.value = Math.max(-20, -1 * state.vocalGain);
+                    n.lowpass.frequency.value = 10000;
+                } else {
+                    n.peaking.gain.value = 0;
+                    n.highshelf.gain.value = 0;
+                    n.lowpass.frequency.value = 22000;
+                }
+            });
+        }
+        // Fallback：AudioContext未建立或Graph失败时，直接用video.volume（上限1.0）
+        if (!audioCtx || !nodes.v1) { v1.volume = Math.min(1, state.vol1); }
+        if (!audioCtx || !nodes.v2) { v2.volume = Math.min(1, state.vol2); }
     }
 
-    // 3. UI 渲染 (V21.3)
+    // 6. 自动视角对齐（实时采集8s PCM + FFT互相关，搜索范围±5s）
+    function autoAlign(v1, v2, onResult, onError) {
+        const SAMPLE_DUR = 8.0;
+        const SEARCH_SEC = 5.0;
+        const SR = audioCtx ? audioCtx.sampleRate : 44100;
+        const FRAME = 2048;
+
+        if (!audioCtx || !nodes.v1 || !nodes.v2 || !nodes.v1.analyser || !nodes.v2.analyser) {
+            onError('音频引擎未就绪，请先点击页面触发音频解锁');
+            return;
+        }
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+
+        const buf1 = [], buf2 = [];
+        const totalFrames = Math.ceil((SAMPLE_DUR * SR) / FRAME);
+        let collected = 0;
+
+        const proc1 = audioCtx.createScriptProcessor(FRAME, 1, 1);
+        const proc2 = audioCtx.createScriptProcessor(FRAME, 1, 1);
+        nodes.v1.analyser.connect(proc1); proc1.connect(audioCtx.destination);
+        nodes.v2.analyser.connect(proc2); proc2.connect(audioCtx.destination);
+
+        proc1.onaudioprocess = e => {
+            if (collected >= totalFrames) return;
+            buf1.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+        };
+        proc2.onaudioprocess = e => {
+            if (collected >= totalFrames) return;
+            buf2.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+            collected++;
+        };
+
+        setTimeout(() => {
+            try { proc1.disconnect(); proc2.disconnect(); } catch(e) {}
+            if (buf1.length < 2 || buf2.length < 2) {
+                onError('采集数据不足，请确保视频正在播放');
+                return;
+            }
+            const n = Math.min(buf1.length, buf2.length);
+            const len = n * FRAME;
+            const s1 = new Float32Array(len);
+            const s2 = new Float32Array(len);
+            buf1.slice(0, n).forEach((f, i) => s1.set(f, i * FRAME));
+            buf2.slice(0, n).forEach((f, i) => s2.set(f, i * FRAME));
+
+            const workerCode = `
+function fft(buf) {
+    const n = buf.length >> 1;
+    for (let i = 1, j = 0; i < n; i++) {
+        let bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            let t = buf[2*i]; buf[2*i] = buf[2*j]; buf[2*j] = t;
+            t = buf[2*i+1]; buf[2*i+1] = buf[2*j+1]; buf[2*j+1] = t;
+        }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+        const ang = -2 * Math.PI / len;
+        const wr = Math.cos(ang), wi = Math.sin(ang);
+        for (let i = 0; i < n; i += len) {
+            let cr = 1, ci = 0;
+            for (let j = 0; j < len >> 1; j++) {
+                const u = 2*(i+j), v = 2*(i+j+(len>>1));
+                const pr = buf[v]*cr - buf[v+1]*ci;
+                const pi = buf[v]*ci + buf[v+1]*cr;
+                buf[v] = buf[u]-pr; buf[v+1] = buf[u+1]-pi;
+                buf[u] += pr; buf[u+1] += pi;
+                const nr = cr*wr - ci*wi; ci = cr*wi + ci*wr; cr = nr;
+            }
+        }
+    }
+}
+function ifft(buf) {
+    const n = buf.length >> 1;
+    for (let i = 1; i < n; i++) buf[2*i+1] = -buf[2*i+1];
+    fft(buf);
+    for (let i = 0; i < n; i++) { buf[2*i] /= n; buf[2*i+1] = -buf[2*i+1] / n; }
+}
+self.onmessage = function(e) {
+    const { s1, s2, SR, SEARCH_SEC } = e.data;
+    const len = s1.length;
+    let sum1 = 0, sum2 = 0;
+    for (let i = 0; i < len; i++) { sum1 += s1[i]*s1[i]; sum2 += s2[i]*s2[i]; }
+    const r1 = Math.sqrt(sum1/len) || 1, r2 = Math.sqrt(sum2/len) || 1;
+    for (let i = 0; i < len; i++) { s1[i] /= r1; s2[i] /= r2; }
+    let fftSize = 1;
+    while (fftSize < 2 * len) fftSize <<= 1;
+    const A = new Float64Array(fftSize * 2), B = new Float64Array(fftSize * 2);
+    for (let i = 0; i < len; i++) { A[2*i] = s1[i]; B[2*i] = s2[i]; }
+    fft(A); fft(B);
+    for (let i = 0; i < fftSize; i++) {
+        const ar=A[2*i],ai=A[2*i+1],br=B[2*i],bi=B[2*i+1];
+        A[2*i]=ar*br+ai*bi; A[2*i+1]=ai*br-ar*bi;
+    }
+    ifft(A);
+    const maxLag = Math.min(Math.floor(SEARCH_SEC * SR), len - 1);
+    let bestLag = 0, bestVal = -Infinity;
+    for (let lag = 0; lag <= maxLag; lag++) {
+        if (A[2*lag] > bestVal) { bestVal = A[2*lag]; bestLag = lag; }
+    }
+    for (let lag = 1; lag <= maxLag; lag++) {
+        const idx = fftSize - lag;
+        if (A[2*idx] > bestVal) { bestVal = A[2*idx]; bestLag = -lag; }
+    }
+    self.postMessage({ bestLag });
+};`;
+            const blob = new Blob([workerCode], { type: 'application/javascript' });
+            const workerUrl = URL.createObjectURL(blob);
+            const worker = new Worker(workerUrl);
+            worker.postMessage({ s1, s2, SR, SEARCH_SEC }, [s1.buffer, s2.buffer]);
+            worker.onmessage = e => {
+                worker.terminate(); URL.revokeObjectURL(workerUrl);
+                const offsetSec = -(e.data.bestLag / SR);
+                onResult(parseFloat(offsetSec.toFixed(2)));
+            };
+            worker.onerror = err => {
+                worker.terminate(); URL.revokeObjectURL(workerUrl);
+                onError('计算出错：' + err.message);
+            };
+        }, SAMPLE_DUR * 1000 + 300);
+    }
+
+
+    // 3. UI 渲染 (V30.0)
     function renderUI(urls) {
+        // === Kill 官方播放器：脚本只是悬浮覆盖，官方jydH5Player仍在底层运行会自动播放 ===
+        // 1. 只静音+暂停，不清空src/load()——避免触发emptied事件导致官方播放器重新初始化抢占AudioContext
+        document.querySelectorAll('video').forEach(v => {
+            try {
+                v.pause();
+                v.muted = true;
+                v.volume = 0;
+            } catch(e) {}
+        });
+        // 2. 覆盖 jydH5Player 函数，阻止其被再次调用（如 getStreamUrlByRpId 的异步回调）
+        try {
+            if (typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.jydH5Player === 'function') {
+                unsafeWindow.jydH5Player = function() {
+                    console.log('[HSP] jydH5Player call intercepted and blocked');
+                };
+            }
+            if (typeof window.jydH5Player === 'function') {
+                window.jydH5Player = function() {};
+            }
+        } catch(e) {}
+        // 3. 定期巡逻：官方播放器可能在之后被自动触发，持续压制
+        setInterval(() => {
+            document.querySelectorAll('video').forEach(v => {
+                if (v.id !== 'hsp-v1' && v.id !== 'hsp-v2') {
+                    if (!v.paused) v.pause();
+                    v.muted = true;
+                    v.volume = 0;
+                }
+            });
+        }, 3000);
+        // === Kill 结束 ===
+
         const styleReset = document.createElement('style');
         styleReset.innerHTML = `html, body { overflow: hidden !important; width: 100%; height: 100%; margin: 0; }`;
         document.head.appendChild(styleReset);
@@ -250,7 +435,7 @@
             .h-btn-act { color: #00a8ff !important; text-shadow: 0 0 12px rgba(0, 168, 255, 0.6); font-weight: bold; }
             .h-btn-dim { opacity: 0.4; filter: grayscale(100%); }
 
-            .prog-wrap { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 6px; position: relative; }
+            .prog-wrap { flex: 3; min-width: 80px; display: flex; flex-direction: column; justify-content: center; gap: 6px; position: relative; }
             .time-txt { font-size: 12px; color: #ccc; font-variant-numeric: tabular-nums; letter-spacing: 0.5px; }
 
             .prog-bar-container {
@@ -286,11 +471,12 @@
             input[type=range]:not(.prog-input)::-webkit-slider-thumb { -webkit-appearance: none; height: 12px; width: 12px; border-radius: 50%; background: #fff; margin-top: -4px; box-shadow: 0 2px 4px #000; transition: transform 0.1s;}
             input[type=range]:not(.prog-input)::hover::-webkit-slider-thumb { transform: scale(1.3); background: #00a8ff; }
 
-            .ctrl-grp { display: flex; flex-direction: column; gap: 2px; width: 120px; }
-            .ctrl-header { display:flex; justify-content:space-between; align-items: center; font-size: 11px; color: #bbb; margin-bottom: 2px;}
-            .ctrl-val { color: #00a8ff; font-weight: bold; }
-            .sync-input { background: transparent; border: none; color: #00a8ff; width: 40px; text-align: right; font-weight:bold; font-size:11px; padding:0; margin:0; height: 14px; line-height:14px;}
-            .sync-unit { margin-left: 2px; line-height:14px; font-size:11px; color:#aaa; }
+            .ctrl-grp { display: flex; flex-direction: column; gap: 2px; flex: 0.5; min-width: 40px; }
+            .ctrl-header { display:flex; justify-content:space-between; align-items: center; font-size: 11px; color: #bbb; margin-bottom: 2px; }
+            .ctrl-header > span:first-child { white-space: nowrap; flex-shrink: 0; }
+            .ctrl-val { color: #00a8ff; font-weight: bold; flex-shrink: 0; }
+            .sync-input { background: transparent; border: none; color: #00a8ff; width: 30px; text-align: right; font-weight:bold; font-size:11px; padding:0; margin:0; height: 14px; line-height:14px; flex-shrink: 0; }
+            .sync-unit { margin-left: 1px; line-height:14px; font-size:11px; color:#aaa; flex-shrink: 0; }
 
             .overlay-panel { position: absolute; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(8px); z-index: 900; display: none; align-items: center; justify-content: center; }
             .panel-card { background: #1e1e1e; width: 800px; padding: 25px; border-radius: 16px; border: 1px solid #444; max-height:85vh; overflow-y:auto; box-shadow: 0 20px 50px rgba(0,0,0,0.8); }
@@ -354,6 +540,7 @@
                                 <li><b>滚轮调音</b> 鼠标在主画面空白处滚动，快速调节主音量</li>
                                 <li><b>人声增强</b> 默认开启 5dB，集成高频降噪与动态压缩</li>
                                 <li><b>视角对齐</b> 0.0s 精度微调，解决主副画面不同步</li>
+                                <li><b>🎯自动对齐</b> 点击后采集8秒音频，互相关算法自动计算偏移。使用前提：① 在老师持续讲话的片段；② 已手动将偏差缩小至5秒以内，再点击🎯精确对齐</li>
                             </ul>
                         </div>
                         <div class="help-item">
@@ -388,10 +575,13 @@
                     </div>
                 </div>
 
-                <div class="ctrl-grp">
+                <div class="ctrl-grp" style="flex:0.8;">
                     <div class="ctrl-header">
                         <span>视角对齐</span>
-                        <div style="display:flex;align-items:center;height:14px;"><input id="sync-input" class="sync-input" value="0.0"><span class="sync-unit">s</span></div>
+                        <div style="display:flex;align-items:center;gap:3px;height:14px;">
+                            <input id="sync-input" class="sync-input" value="0.0"><span class="sync-unit">s</span>
+                            <button id="btn-auto-align" title="自动对齐：采集8秒音频波形互相关计算偏移" style="background:none;border:none;color:#00a8ff;cursor:pointer;font-size:11px;padding:0;line-height:14px;height:14px;flex-shrink:0;">🎯</button>
+                        </div>
                     </div>
                     <input type="range" id="sync-slider" min="-60" max="60" step="0.1" value="0">
                 </div>
@@ -411,7 +601,7 @@
                     <input type="range" id="vol-2" max="5" step="0.1" value="0">
                 </div>
 
-                <div class="ctrl-grp" style="width:80px;">
+                <div class="ctrl-grp">
                     <div class="ctrl-header"><span>倍速</span><span id="txt-rate" class="ctrl-val">1.0x</span></div>
                     <input type="range" id="rate-bar" min="0.5" max="3.5" step="0.1" value="1">
                 </div>
@@ -446,6 +636,7 @@
         const hls1 = new Hls(hlsConfig);
         const hls2 = new Hls(hlsConfig);
 
+        // 只保留当前播放时间附近的片段，快进后自动使用新数据
         const load = (hls, v, url) => {
             if(Hls.isSupported()) { hls.loadSource(url); hls.attachMedia(v); }
             else { v.src = url; }
@@ -711,6 +902,37 @@
         const syncIn=document.getElementById('sync-input'), syncSl=document.getElementById('sync-slider');
         const setSync=v=>{state.syncOffset=parseFloat(v);syncIn.value=state.syncOffset.toFixed(1);syncSl.value=state.syncOffset;};
         syncIn.onchange=e=>setSync(e.target.value); syncSl.oninput=e=>setSync(e.target.value);
+
+        // 自动对齐按钮
+        const btnAutoAlign = document.getElementById('btn-auto-align');
+        btnAutoAlign.onclick = () => {
+            if (btnAutoAlign.disabled) return;
+            btnAutoAlign.disabled = true;
+            btnAutoAlign.style.opacity = '0.5';
+            btnAutoAlign.title = '分析中…';
+            showToast('🎯 采集音频中，请保持播放（约8秒）…');
+
+            autoAlign(v1, v2,
+                (delta) => {
+                    // delta是在当前syncOffset基础上的修正量，叠加而非替换
+                    const newOffset = parseFloat((state.syncOffset + delta).toFixed(2));
+                    setSync(newOffset);
+                    // 立即应用到slave
+                    const tgt = master.currentTime + newOffset;
+                    if (Math.abs(slave.currentTime - tgt) > 0.05) slave.currentTime = tgt;
+                    showToast(`🎯 自动对齐完成：修正${delta >= 0 ? '+' : ''}${delta.toFixed(2)}s → 总偏移${newOffset >= 0 ? '+' : ''}${newOffset.toFixed(2)}s`);
+                    btnAutoAlign.disabled = false;
+                    btnAutoAlign.style.opacity = '1';
+                    btnAutoAlign.title = '自动对齐：采集8秒音频波形互相关计算偏移';
+                },
+                (errMsg) => {
+                    showToast('⚠️ ' + errMsg);
+                    btnAutoAlign.disabled = false;
+                    btnAutoAlign.style.opacity = '1';
+                    btnAutoAlign.title = '自动对齐：采集8秒音频波形互相关计算偏移';
+                }
+            );
+        };
         document.getElementById('rate-bar').oninput = e => { const r=parseFloat(e.target.value); master.playbackRate=slave.playbackRate=r; document.getElementById('txt-rate').textContent=r.toFixed(1)+'x'; };
         document.getElementById('btn-fs').onclick = () => { const r=document.getElementById('hsp-root-v20'); if(!document.fullscreenElement) r.requestFullscreen(); else document.exitFullscreen(); };
         document.getElementById('btn-help').onclick = () => document.getElementById('hsp-help').style.display = 'flex';
