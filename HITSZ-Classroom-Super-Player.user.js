@@ -1,13 +1,11 @@
 // ==UserScript==
 // @name         HITSZ 课堂视频超级播放器
 // @namespace    http://tampermonkey.net/
-// @version      32.0
-// @description  【仅支持 Violentmonkey 暴力猴，不支持 Tampermonkey 油猴】HITSZ 视频平台功能增强脚本。现代化UI，进度条拖动精准流畅。支持画中画（老师与课件同时显示），可调整大小比例，去黑边。支持两通道音量在0-500%独立调节，支持人声增强。
+// @version      61.0
+// @description  【仅支持 Violentmonkey 暴力猴，不支持 Tampermonkey 油猴】HITSZ 视频平台功能增强脚本。现代化UI，双流同屏，实时自动对齐，可调整大小比例，去黑边。支持两通道音量在0-500%独立调节，支持人声增强。
 // @author       BCC
 // @match        *://jxypt.hitsz.edu.cn/ve/back/rp/common/rpIndex.shtml?method=studyCourseDeatil*
 // @match        *://jxypt-hitsz-edu-cn-s.hitsz.edu.cn/ve/back/rp/common/rpIndex.shtml?method=studyCourseDeatil*
-// @updateURL    https://openuserjs.org/meta/BCC-HIT/HITSZ_%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8.meta.js
-// @downloadURL  https://openuserjs.org/install/BCC-HIT/HITSZ_%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8.user.js
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.4.0/dist/hls.min.js
 // @grant        unsafeWindow
 // @license      MIT
@@ -18,6 +16,8 @@
     'use strict';
 
     const capturedUrls = new Set();
+    const bootId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    if (typeof unsafeWindow !== 'undefined') unsafeWindow.__HSP_BOOT_ID__ = bootId;
 
     let isPlayerLaunched = false;
     let videoMeta = { title: '未知课程', teacher: '未知教师', date: '' };
@@ -26,6 +26,9 @@
     const state = {
         isSwapped: false,
         syncOffset: 0.0,
+        realtimeAlign: false,
+        alignStatus: '待机',
+        lastAlign: null,
         vocalGain: 5,
         isPipVisible: true,
         isCropV1: false,
@@ -40,8 +43,36 @@
 
     let audioCtx;
     const nodes = { v1: null, v2: null };
+    const audioNodeFailed = { v1: false, v2: false };
+    const audioCapture = {
+        frame: 2048,
+        maxSec: 150,
+        chunks: { v1: [], v2: [] },
+        samples: { v1: 0, v2: 0 },
+        totalSamples: { v1: 0, v2: 0 },
+        processors: { v1: null, v2: null },
+        sink: null
+    };
+    const runtime = {
+        timers: [],
+        cleanups: [],
+        current: null
+    };
+    const offlineAlignCache = {
+        playlists: new Map(),
+        segmentFrames: new Map()
+    };
+    try {
+        if (typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.__HSP_CLEANUP__ === 'function') {
+            unsafeWindow.__HSP_CLEANUP__();
+        }
+    } catch(e) {}
 
-    console.log("HSP V30.0 (Author: BCC): 引擎启动...");
+    console.log("HSP V61.0 (Author: BCC): 引擎启动...");
+
+    function isCurrentBoot() {
+        return typeof unsafeWindow === 'undefined' || unsafeWindow.__HSP_BOOT_ID__ === bootId;
+    }
 
     // 0. 信息抓取
     function scrapePageInfo() {
@@ -105,9 +136,10 @@
     let launchTimer;
     let launchScheduled = false; // 修复：防止延迟窗口内重复排期
     function tryLaunch() {
-        if (isPlayerLaunched || launchScheduled) return;
+        if (!isCurrentBoot() || isPlayerLaunched || launchScheduled) return;
         launchScheduled = true; // 立刻锁住，后续XHR/fetch不再重置计时器
         launchTimer = setTimeout(() => {
+            if (!isCurrentBoot()) return;
             // 修复：严格限制最多取前两条，防止HLS子manifest被误当第二路流
             const validList = Array.from(capturedUrls).filter(isValidStream).slice(0, 2);
             if (validList.length > 0) {
@@ -121,8 +153,29 @@
         }, 1200);
     }
 
+    try {
+        const devStreams = (typeof unsafeWindow !== 'undefined' && Array.isArray(unsafeWindow.__HSP_DEV_STREAMS))
+            ? unsafeWindow.__HSP_DEV_STREAMS
+            : [];
+        devStreams.forEach(url => {
+            if (isValidStream(url)) capturedUrls.add(url);
+        });
+        if (typeof unsafeWindow !== 'undefined') {
+            unsafeWindow.__HSP_DEV_ON_STREAM = (url) => {
+                if (!isValidStream(url)) return;
+                capturedUrls.add(url);
+                tryLaunch();
+            };
+        }
+        if (capturedUrls.size > 0) tryLaunch();
+        console.log(`[HSP DevPayload] Pre-captured streams: ${capturedUrls.size}`);
+    } catch(e) {
+        console.warn('[HSP DevPayload] Failed to import pre-captured streams:', e);
+    }
+
     // 2. 音频引擎
     function setupAudioNode(videoEl, id) {
+        if (!videoEl || audioNodeFailed[id]) return nodes[id];
         if (nodes[id]) return nodes[id];
         try {
             if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -148,9 +201,11 @@
             gain.connect(audioCtx.destination);
 
             nodes[id] = { gain, lowpass, highpass, highshelf, peaking, compressor, analyser };
+            audioNodeFailed[id] = false;
         } catch(e) {
             // Web Audio Graph 建立失败（如AudioContext被抢占），降级为直接用video.volume
             console.warn('[HSP] Web Audio fallback for', id, e);
+            audioNodeFailed[id] = true;
             nodes[id] = null; // 保持null，updateAudioState会用video.volume兜底
         }
         return nodes[id];
@@ -159,16 +214,21 @@
     function updateAudioState(v1, v2) {
         // Web Audio Graph路径
         if (audioCtx) {
-            if (audioCtx.state === 'suspended') audioCtx.resume();
+            if (audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
             if (nodes.v1) { v1.volume = 1; nodes.v1.gain.gain.value = state.vol1; }
-            if (nodes.v2) { v2.volume = 1; nodes.v2.gain.gain.value = state.vol2; }
+            if (v2 && nodes.v2) { v2.volume = 1; nodes.v2.gain.gain.value = state.vol2; }
             [nodes.v1, nodes.v2].forEach(n => {
                 if (!n) return;
                 if (state.vocalGain > 0) {
+                    n.highpass.frequency.value = 95;
+                    n.lowpass.frequency.value = 14500;
+                    n.peaking.frequency.value = 2400;
+                    n.peaking.Q.value = 0.95;
                     n.peaking.gain.value = state.vocalGain;
-                    n.highshelf.gain.value = Math.max(-20, -1 * state.vocalGain);
-                    n.lowpass.frequency.value = 10000;
+                    n.highshelf.frequency.value = 5200;
+                    n.highshelf.gain.value = Math.min(3.5, state.vocalGain * 0.12);
                 } else {
+                    n.highpass.frequency.value = 80;
                     n.peaking.gain.value = 0;
                     n.highshelf.gain.value = 0;
                     n.lowpass.frequency.value = 22000;
@@ -177,53 +237,206 @@
         }
         // Fallback：AudioContext未建立或Graph失败时，直接用video.volume（上限1.0）
         if (!audioCtx || !nodes.v1) { v1.volume = Math.min(1, state.vol1); }
-        if (!audioCtx || !nodes.v2) { v2.volume = Math.min(1, state.vol2); }
+        if (v2 && (!audioCtx || !nodes.v2)) { v2.volume = Math.min(1, state.vol2); }
     }
 
-    // 6. 自动视角对齐（实时采集8s PCM + FFT互相关，搜索范围±5s）
-    function autoAlign(v1, v2, onResult, onError) {
-        const SAMPLE_DUR = 8.0;
-        const SEARCH_SEC = 5.0;
-        const SR = audioCtx ? audioCtx.sampleRate : 44100;
-        const FRAME = 2048;
-
-        if (!audioCtx || !nodes.v1 || !nodes.v2 || !nodes.v1.analyser || !nodes.v2.analyser) {
-            onError('音频引擎未就绪，请先点击页面触发音频解锁');
-            return;
+    function pushAudioChunk(id, chunk) {
+        const copy = new Float32Array(chunk);
+        const start = audioCapture.totalSamples[id];
+        const end = start + copy.length;
+        audioCapture.chunks[id].push({ data: copy, start, end, offset: Number(state.syncOffset) || 0 });
+        audioCapture.totalSamples[id] = end;
+        audioCapture.samples[id] += copy.length;
+        const maxSamples = Math.ceil((audioCtx ? audioCtx.sampleRate : 44100) * audioCapture.maxSec);
+        while (audioCapture.samples[id] > maxSamples && audioCapture.chunks[id].length > 1) {
+            const old = audioCapture.chunks[id].shift();
+            audioCapture.samples[id] -= old.data.length;
         }
-        if (audioCtx.state === 'suspended') audioCtx.resume();
+    }
 
-        const buf1 = [], buf2 = [];
-        const totalFrames = Math.ceil((SAMPLE_DUR * SR) / FRAME);
-        let collected = 0;
+    function ensureAudioCapture() {
+        if (!audioCtx || !nodes.v1 || !nodes.v2 || !nodes.v1.analyser || !nodes.v2.analyser) return false;
+        if (!audioCapture.sink) {
+            audioCapture.sink = audioCtx.createGain();
+            audioCapture.sink.gain.value = 0;
+            audioCapture.sink.connect(audioCtx.destination);
+        }
+        ['v1', 'v2'].forEach(id => {
+            if (audioCapture.processors[id]) return;
+            const proc = audioCtx.createScriptProcessor(audioCapture.frame, 1, 1);
+            proc.onaudioprocess = e => pushAudioChunk(id, e.inputBuffer.getChannelData(0));
+            nodes[id].analyser.connect(proc);
+            proc.connect(audioCapture.sink);
+            audioCapture.processors[id] = proc;
+        });
+        return true;
+    }
 
-        const proc1 = audioCtx.createScriptProcessor(FRAME, 1, 1);
-        const proc2 = audioCtx.createScriptProcessor(FRAME, 1, 1);
-        nodes.v1.analyser.connect(proc1); proc1.connect(audioCtx.destination);
-        nodes.v2.analyser.connect(proc2); proc2.connect(audioCtx.destination);
+    function availableAudioSamples(id, afterSample = null) {
+        if (!Number.isFinite(afterSample)) return audioCapture.samples[id];
+        let count = 0;
+        audioCapture.chunks[id].forEach(chunk => {
+            if (chunk.end <= afterSample) return;
+            count += chunk.end - Math.max(chunk.start, afterSample);
+        });
+        return count;
+    }
 
-        proc1.onaudioprocess = e => {
-            if (collected >= totalFrames) return;
-            buf1.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-        };
-        proc2.onaudioprocess = e => {
-            if (collected >= totalFrames) return;
-            buf2.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-            collected++;
-        };
+    function recentAudio(id, seconds, afterSample = null) {
+        const sr = audioCtx ? audioCtx.sampleRate : 44100;
+        const need = Math.ceil(seconds * sr);
+        const available = availableAudioSamples(id, afterSample);
+        if (available < need * 0.75) return null;
+        const out = new Float32Array(Math.min(need, available));
+        let offset = out.length;
+        for (let i = audioCapture.chunks[id].length - 1; i >= 0 && offset > 0; i--) {
+            const chunk = audioCapture.chunks[id][i];
+            if (Number.isFinite(afterSample) && chunk.end <= afterSample) continue;
+            const data = chunk.data;
+            const startInChunk = Number.isFinite(afterSample) ? Math.max(0, afterSample - chunk.start) : 0;
+            const usable = data.length - startInChunk;
+            const take = Math.min(usable, offset);
+            offset -= take;
+            out.set(data.subarray(data.length - take), offset);
+        }
+        return offset === 0 ? out : out.subarray(offset);
+    }
 
-        setTimeout(() => {
-            try { proc1.disconnect(); proc2.disconnect(); } catch(e) {}
-            if (buf1.length < 2 || buf2.length < 2) {
-                onError('采集数据不足，请确保视频正在播放');
+    function capturedAudioSeconds(id, afterSample = null) {
+        const sr = audioCtx ? audioCtx.sampleRate : 44100;
+        return availableAudioSamples(id, afterSample) / sr;
+    }
+
+    function copyAudioRange(id, start, end) {
+        const len = Math.max(0, end - start);
+        const out = new Float32Array(len);
+        if (!len) return out;
+        let written = 0;
+        audioCapture.chunks[id].forEach(chunk => {
+            if (chunk.end <= start || chunk.start >= end) return;
+            const from = Math.max(start, chunk.start);
+            const to = Math.min(end, chunk.end);
+            if (to <= from) return;
+            out.set(chunk.data.subarray(from - chunk.start, to - chunk.start), written);
+            written += to - from;
+        });
+        return written === len ? out : out.subarray(0, written);
+    }
+
+    function projectedAudioSeconds(baseOffset) {
+        const sr = audioCtx ? audioCtx.sampleRate : 44100;
+        const v2Chunks = audioCapture.chunks.v2;
+        if (!audioCapture.chunks.v1.length || !v2Chunks.length) return 0;
+        const v2Min = v2Chunks[0].start;
+        const v2Max = v2Chunks[v2Chunks.length - 1].end;
+        let total = 0;
+        audioCapture.chunks.v1.forEach(chunk => {
+            const shift = Math.round((baseOffset - (chunk.offset || 0)) * sr);
+            const start = Math.max(chunk.start, v2Min - shift);
+            const end = Math.min(chunk.end, v2Max - shift);
+            if (end > start) total += end - start;
+        });
+        return total / sr;
+    }
+
+    function projectedRecentAudioPair(seconds, baseOffset) {
+        const sr = audioCtx ? audioCtx.sampleRate : 44100;
+        const need = Math.ceil(seconds * sr);
+        const v2Chunks = audioCapture.chunks.v2;
+        if (!audioCapture.chunks.v1.length || !v2Chunks.length) return null;
+        const v2Min = v2Chunks[0].start;
+        const v2Max = v2Chunks[v2Chunks.length - 1].end;
+        const parts1 = [];
+        const parts2 = [];
+        let total = 0;
+
+        for (let i = audioCapture.chunks.v1.length - 1; i >= 0 && total < need; i--) {
+            const chunk = audioCapture.chunks.v1[i];
+            const shift = Math.round((baseOffset - (chunk.offset || 0)) * sr);
+            let start = Math.max(chunk.start, v2Min - shift);
+            let end = Math.min(chunk.end, v2Max - shift);
+            if (end <= start) continue;
+            const take = Math.min(end - start, need - total);
+            start = end - take;
+            const a = copyAudioRange('v1', start, end);
+            const b = copyAudioRange('v2', start + shift, end + shift);
+            const len = Math.min(a.length, b.length);
+            if (len <= 0) continue;
+            parts1.unshift(a.length === len ? a : a.subarray(a.length - len));
+            parts2.unshift(b.length === len ? b : b.subarray(b.length - len));
+            total += len;
+        }
+
+        if (total < need * 0.75) return null;
+        const s1 = new Float32Array(total);
+        const s2 = new Float32Array(total);
+        let at = 0;
+        for (let i = 0; i < parts1.length; i++) {
+            s1.set(parts1[i], at);
+            s2.set(parts2[i], at);
+            at += parts1[i].length;
+        }
+        return { s1, s2, seconds: total / sr };
+    }
+
+    function captureTotals() {
+        return { v1: audioCapture.totalSamples.v1, v2: audioCapture.totalSamples.v2 };
+    }
+
+    function clearAudioCapture(resetLastAlign = true) {
+        audioCapture.chunks.v1 = [];
+        audioCapture.chunks.v2 = [];
+        audioCapture.samples.v1 = 0;
+        audioCapture.samples.v2 = 0;
+        audioCapture.totalSamples.v1 = 0;
+        audioCapture.totalSamples.v2 = 0;
+        if (resetLastAlign) state.lastAlign = null;
+    }
+
+    function validateAlignResult(detail, opts = {}) {
+        const minConfidence = opts.minConfidence || 1.10;
+        const minRms = opts.minRms || 0.001;
+        const minPeak = opts.minPeak || 0.10;
+        const maxAbsDelta = opts.maxAbsDelta || 4.8;
+        if (!detail) return { ok: false, reason: '计算失败' };
+        if (detail.rms1 < minRms || detail.rms2 < minRms) return { ok: false, reason: '声音太弱，等待老师持续讲话' };
+        if (Math.abs(detail.delta) > maxAbsDelta) return { ok: false, reason: '已取当前±10s内最佳值；请确认是否先手动调近' };
+        if (opts.silenceOnlyValidation) return { ok: true, reason: 'ok' };
+        if (detail.confidence < minConfidence) return { ok: false, reason: `置信度不足 ${detail.confidence.toFixed(2)}` };
+        if (detail.peak < minPeak) return { ok: false, reason: `互相关峰值过低 ${detail.peak.toFixed(2)}` };
+        return { ok: true, reason: 'ok' };
+    }
+
+    function estimateAlignment(s1, s2, sr, searchSec) {
+        return new Promise((resolve, reject) => {
+            if (!s1 || !s2 || s1.length < sr || s2.length < sr) {
+                reject(new Error('采集数据不足，请保持播放'));
                 return;
             }
-            const n = Math.min(buf1.length, buf2.length);
-            const len = n * FRAME;
-            const s1 = new Float32Array(len);
-            const s2 = new Float32Array(len);
-            buf1.slice(0, n).forEach((f, i) => s1.set(f, i * FRAME));
-            buf2.slice(0, n).forEach((f, i) => s2.set(f, i * FRAME));
+            const len = Math.min(s1.length, s2.length);
+            let a = s1.length === len ? s1 : s1.subarray(s1.length - len);
+            let b = s2.length === len ? s2 : s2.subarray(s2.length - len);
+            let workSr = sr;
+
+            if (searchSec > 30 && sr > 12000) {
+                const factor = Math.max(2, Math.floor(sr / 12000));
+                const outLen = Math.floor(len / factor);
+                const da = new Float32Array(outLen);
+                const db = new Float32Array(outLen);
+                for (let i = 0; i < outLen; i++) {
+                    let sa = 0, sb = 0;
+                    const base = i * factor;
+                    for (let j = 0; j < factor; j++) {
+                        sa += a[base + j] || 0;
+                        sb += b[base + j] || 0;
+                    }
+                    da[i] = sa / factor;
+                    db[i] = sb / factor;
+                }
+                a = da;
+                b = db;
+                workSr = sr / factor;
+            }
 
             const workerCode = `
 function fft(buf) {
@@ -264,8 +477,12 @@ self.onmessage = function(e) {
     const len = s1.length;
     let sum1 = 0, sum2 = 0;
     for (let i = 0; i < len; i++) { sum1 += s1[i]*s1[i]; sum2 += s2[i]*s2[i]; }
-    const r1 = Math.sqrt(sum1/len) || 1, r2 = Math.sqrt(sum2/len) || 1;
-    for (let i = 0; i < len; i++) { s1[i] /= r1; s2[i] /= r2; }
+    const rms1 = Math.sqrt(sum1/len) || 0, rms2 = Math.sqrt(sum2/len) || 0;
+    const r1 = rms1 || 1, r2 = rms2 || 1;
+    let mean1 = 0, mean2 = 0;
+    for (let i = 0; i < len; i++) { mean1 += s1[i]; mean2 += s2[i]; }
+    mean1 /= len; mean2 /= len;
+    for (let i = 0; i < len; i++) { s1[i] = (s1[i] - mean1) / r1; s2[i] = (s2[i] - mean2) / r2; }
     let fftSize = 1;
     while (fftSize < 2 * len) fftSize <<= 1;
     const A = new Float64Array(fftSize * 2), B = new Float64Array(fftSize * 2);
@@ -277,35 +494,459 @@ self.onmessage = function(e) {
     }
     ifft(A);
     const maxLag = Math.min(Math.floor(SEARCH_SEC * SR), len - 1);
-    let bestLag = 0, bestVal = -Infinity;
+    const guard = Math.max(1, Math.floor(0.25 * SR));
+    let bestLag = 0, bestVal = -Infinity, secondVal = -Infinity;
+    function visit(lag, val) {
+        if (val > bestVal) {
+            if (Math.abs(lag - bestLag) > guard) secondVal = bestVal;
+            bestVal = val; bestLag = lag;
+        } else if (Math.abs(lag - bestLag) > guard && val > secondVal) {
+            secondVal = val;
+        }
+    }
     for (let lag = 0; lag <= maxLag; lag++) {
-        if (A[2*lag] > bestVal) { bestVal = A[2*lag]; bestLag = lag; }
+        visit(lag, A[2*lag]);
     }
     for (let lag = 1; lag <= maxLag; lag++) {
         const idx = fftSize - lag;
-        if (A[2*idx] > bestVal) { bestVal = A[2*idx]; bestLag = -lag; }
+        visit(-lag, A[2*idx]);
     }
-    self.postMessage({ bestLag });
+    const confidence = bestVal > 0 && secondVal > 0 ? bestVal / secondVal : (bestVal > 0 ? 99 : 0);
+    self.postMessage({ bestLag, peak: bestVal / len, confidence, rms1, rms2 });
 };`;
             const blob = new Blob([workerCode], { type: 'application/javascript' });
             const workerUrl = URL.createObjectURL(blob);
             const worker = new Worker(workerUrl);
-            worker.postMessage({ s1, s2, SR, SEARCH_SEC }, [s1.buffer, s2.buffer]);
+            worker.postMessage({ s1: new Float32Array(a), s2: new Float32Array(b), SR: workSr, SEARCH_SEC: searchSec });
             worker.onmessage = e => {
                 worker.terminate(); URL.revokeObjectURL(workerUrl);
-                const offsetSec = -(e.data.bestLag / SR);
-                onResult(parseFloat(offsetSec.toFixed(2)));
+                const offsetSec = -(e.data.bestLag / workSr);
+                resolve({
+                    delta: parseFloat(offsetSec.toFixed(3)),
+                    confidence: e.data.confidence || 0,
+                    peak: e.data.peak || 0,
+                    rms1: e.data.rms1 || 0,
+                    rms2: e.data.rms2 || 0,
+                    lag: e.data.bestLag,
+                    sampleRate: Math.round(workSr)
+                });
             };
             worker.onerror = err => {
                 worker.terminate(); URL.revokeObjectURL(workerUrl);
-                onError('计算出错：' + err.message);
+                reject(new Error('计算出错：' + err.message));
             };
-        }, SAMPLE_DUR * 1000 + 300);
+        });
+    }
+
+    // 手动/实时共用的自动对齐入口。delta 是当前播放器间的残余误差；
+    // targetOffset 是基于调用时 baseOffset 得出的绝对候选，避免重复点击时累加旧误差。
+    function autoAlign(v1, v2, onResult, onError, opts = {}) {
+        const sampleDur = opts.sampleDur || 8.0;
+        const minSampleDur = opts.minSampleDur || Math.min(4, sampleDur);
+        const searchSec = opts.searchSec || 5.0;
+        const sr = audioCtx ? audioCtx.sampleRate : 44100;
+        const baseOffset = Number.isFinite(opts.baseOffset) ? opts.baseOffset : state.syncOffset;
+        const afterSamples = opts.afterSamples || null;
+        const projectHistory = !!opts.projectHistory && !afterSamples;
+
+        if (!audioCtx || !nodes.v1 || !nodes.v2 || !nodes.v1.analyser || !nodes.v2.analyser) {
+            onError('音频引擎未就绪，请先点击页面触发音频解锁');
+            return;
+        }
+        if (audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+        if (!ensureAudioCapture()) {
+            onError('音频采集未就绪');
+            return;
+        }
+
+        const run = () => {
+            const available = Math.min(projectHistory
+                ? projectedAudioSeconds(baseOffset)
+                : Math.min(
+                    capturedAudioSeconds('v1', afterSamples && afterSamples.v1),
+                    capturedAudioSeconds('v2', afterSamples && afterSamples.v2)
+                ),
+                sampleDur);
+            const effectiveSampleDur = Math.max(minSampleDur, Math.min(sampleDur, available));
+            const projected = projectHistory ? projectedRecentAudioPair(effectiveSampleDur, baseOffset) : null;
+            const s1 = projected ? projected.s1 : recentAudio('v1', effectiveSampleDur, afterSamples && afterSamples.v1);
+            const s2 = projected ? projected.s2 : recentAudio('v2', effectiveSampleDur, afterSamples && afterSamples.v2);
+            if (!s1 || !s2) {
+                onError('采集数据不足，请保持播放');
+                return;
+            }
+            const actualSearchSec = Math.max(0, Math.min(searchSec, effectiveSampleDur - 0.5));
+            if (opts.minSearchSec && actualSearchSec < opts.minSearchSec) {
+                onError(`采样还不够：当前可搜索 ±${actualSearchSec.toFixed(1)}s，请继续播放有声音片段`, {
+                    sampleDur: effectiveSampleDur,
+                    searchSec: actualSearchSec,
+                    requestedSearchSec: searchSec
+                });
+                return;
+            }
+            estimateAlignment(s1, s2, sr, actualSearchSec)
+                .then(detail => {
+                    detail.sampleDur = effectiveSampleDur;
+                    detail.searchSec = actualSearchSec;
+                    detail.availableSec = projected ? projected.seconds : available;
+                    detail.projectedHistory = projectHistory;
+                    detail.baseOffset = baseOffset;
+                    detail.targetOffset = parseFloat((baseOffset + detail.delta).toFixed(3));
+                    const verdict = validateAlignResult(detail, opts);
+                    detail.ok = verdict.ok;
+                    detail.reason = verdict.reason;
+                    state.lastAlign = detail;
+                    if (!verdict.ok) {
+                        onError(verdict.reason, detail);
+                        return;
+                    }
+                    onResult(detail);
+                })
+                .catch(err => onError(err.message));
+        };
+
+        if ((projectHistory
+            ? projectedAudioSeconds(baseOffset)
+            : Math.min(
+                capturedAudioSeconds('v1', afterSamples && afterSamples.v1),
+                capturedAudioSeconds('v2', afterSamples && afterSamples.v2)
+            )) >= minSampleDur) run();
+        else setTimeout(run, Math.ceil(minSampleDur * 1000) + 250);
+    }
+
+    function parseM3u8(text, baseUrl) {
+        const out = [];
+        let pendingDuration = 0;
+        text.split(/\r?\n/).forEach(raw => {
+            const line = raw.trim();
+            if (!line) return;
+            if (line.startsWith('#EXTINF:')) {
+                pendingDuration = parseFloat(line.slice(8)) || 0;
+                return;
+            }
+            if (line.startsWith('#')) return;
+            out.push({ url: new URL(line, baseUrl).href, duration: pendingDuration || 0 });
+            pendingDuration = 0;
+        });
+        return out;
+    }
+
+    function readPts90k(data, off) {
+        return (((data[off] & 0x0e) * 536870912) +
+            ((data[off + 1] << 22) | ((data[off + 2] & 0xfe) << 14) | (data[off + 3] << 7) | ((data[off + 4] & 0xfe) >> 1))) / 90000;
+    }
+
+    function parsePat(payload) {
+        const pointer = payload[0] || 0;
+        let p = 1 + pointer;
+        if (payload[p] !== 0x00) return null;
+        const sectionLength = ((payload[p + 1] & 0x0f) << 8) | payload[p + 2];
+        const end = p + 3 + sectionLength - 4;
+        p += 8;
+        while (p + 4 <= end) {
+            const program = (payload[p] << 8) | payload[p + 1];
+            const pid = ((payload[p + 2] & 0x1f) << 8) | payload[p + 3];
+            if (program !== 0) return pid;
+            p += 4;
+        }
+        return null;
+    }
+
+    function parsePmt(payload) {
+        const pointer = payload[0] || 0;
+        let p = 1 + pointer;
+        if (payload[p] !== 0x02) return null;
+        const sectionLength = ((payload[p + 1] & 0x0f) << 8) | payload[p + 2];
+        const end = p + 3 + sectionLength - 4;
+        const programInfoLength = ((payload[p + 10] & 0x0f) << 8) | payload[p + 11];
+        p += 12 + programInfoLength;
+        const streams = [];
+        while (p + 5 <= end) {
+            const streamType = payload[p];
+            const pid = ((payload[p + 1] & 0x1f) << 8) | payload[p + 2];
+            const infoLen = ((payload[p + 3] & 0x0f) << 8) | payload[p + 4];
+            streams.push({ streamType, pid });
+            p += 5 + infoLen;
+        }
+        return streams;
+    }
+
+    function collectAdtsFrames(chunks, pts, out) {
+        const len = chunks.reduce((n, c) => n + c.length, 0);
+        const data = new Uint8Array(len);
+        let at = 0;
+        chunks.forEach(c => { data.set(c, at); at += c.length; });
+        let p = 0;
+        let idx = 0;
+        while (p + 7 < data.length) {
+            if (data[p] !== 0xff || (data[p + 1] & 0xf0) !== 0xf0) {
+                p++;
+                continue;
+            }
+            const frameLen = ((data[p + 3] & 0x03) << 11) | (data[p + 4] << 3) | ((data[p + 5] & 0xe0) >> 5);
+            if (frameLen < 7 || p + frameLen > data.length) {
+                p++;
+                continue;
+            }
+            out.push({ t: pts + idx * 1024 / 44100, size: frameLen });
+            idx++;
+            p += frameLen;
+        }
+    }
+
+    function fingerprintTsSegments(buffers, segmentDuration = 10) {
+        let pmtPid = null;
+        let audioPid = null;
+        let currentPts = null;
+        let fallbackTime = 0;
+        const frames = [];
+        buffers.forEach(buffer => {
+            const data = new Uint8Array(buffer);
+            const pesByPid = new Map();
+            for (let off = 0; off + 188 <= data.length; off += 188) {
+                if (data[off] !== 0x47) continue;
+                const payloadStart = !!(data[off + 1] & 0x40);
+                const pid = ((data[off + 1] & 0x1f) << 8) | data[off + 2];
+                const afc = (data[off + 3] >> 4) & 0x03;
+                let p = off + 4;
+                if (afc === 2 || afc === 0) continue;
+                if (afc === 3) p += 1 + data[p];
+                if (p >= off + 188) continue;
+                const payload = data.subarray(p, off + 188);
+                if (pid === 0 && payloadStart) {
+                    const parsed = parsePat(payload);
+                    if (parsed != null) pmtPid = parsed;
+                    continue;
+                }
+                if (pmtPid != null && pid === pmtPid && payloadStart) {
+                    const streams = parsePmt(payload);
+                    const audio = streams && streams.find(s => s.streamType === 0x0f || s.streamType === 0x11 || s.streamType === 0x03 || s.streamType === 0x04);
+                    if (audio) audioPid = audio.pid;
+                    continue;
+                }
+                if (audioPid == null || pid !== audioPid) continue;
+                if (payloadStart) {
+                    const prev = pesByPid.get(pid);
+                    if (prev) collectAdtsFrames(prev.bytes, prev.pts ?? fallbackTime, frames);
+                    let pts = null;
+                    let start = 0;
+                    if (payload[0] === 0x00 && payload[1] === 0x00 && payload[2] === 0x01) {
+                        const flags = payload[7] || 0;
+                        const headerLen = payload[8] || 0;
+                        if (flags & 0x80) pts = readPts90k(payload, 9);
+                        start = 9 + headerLen;
+                    }
+                    currentPts = pts;
+                    pesByPid.set(pid, { pts, bytes: [payload.subarray(start)] });
+                } else {
+                    const pes = pesByPid.get(pid);
+                    if (pes) pes.bytes.push(payload);
+                }
+            }
+            pesByPid.forEach(pes => collectAdtsFrames(pes.bytes, pes.pts ?? currentPts ?? fallbackTime, frames));
+            fallbackTime += segmentDuration;
+        });
+        frames.sort((a, b) => a.t - b.t);
+        return frames;
+    }
+
+    function normalizeVector(values) {
+        let sum = 0, count = 0;
+        for (const v of values) if (v) { sum += v; count++; }
+        const mean = count ? sum / count : 0;
+        let sq = 0;
+        for (let i = 0; i < values.length; i++) {
+            if (!values[i]) continue;
+            values[i] -= mean;
+            sq += values[i] * values[i];
+        }
+        const rms = Math.sqrt(sq / Math.max(1, count)) || 1;
+        for (let i = 0; i < values.length; i++) if (values[i]) values[i] /= rms;
+    }
+
+    function correlateFingerprints(aFrames, bFrames, maxLagSec = 90) {
+        const a0 = aFrames[0]?.t || 0;
+        const b0 = bFrames[0]?.t || 0;
+        const bin = 1024 / 44100;
+        const a = aFrames.map(f => ({ t: f.t - a0, v: Math.log(Math.max(1, f.size)) }));
+        const b = bFrames.map(f => ({ t: f.t - b0, v: Math.log(Math.max(1, f.size)) }));
+        const n = Math.ceil(Math.max(a.at(-1)?.t || 0, b.at(-1)?.t || 0) / bin) + 2;
+        const av = new Float64Array(n);
+        const bv = new Float64Array(n);
+        a.forEach(f => { av[Math.round(f.t / bin)] = f.v; });
+        b.forEach(f => { bv[Math.round(f.t / bin)] = f.v; });
+        normalizeVector(av);
+        normalizeVector(bv);
+        const maxLag = Math.round(maxLagSec / bin);
+        const guard = Math.round(2 / bin);
+        let best = { lag: 0, score: -Infinity };
+        let second = -Infinity;
+        for (let lag = -maxLag; lag <= maxLag; lag++) {
+            let s = 0, count = 0;
+            for (let i = 0; i < n; i++) {
+                const j = i + lag;
+                if (j < 0 || j >= n) continue;
+                s += av[i] * bv[j];
+                count++;
+            }
+            const score = count ? s / count : -Infinity;
+            if (score > best.score) {
+                if (Math.abs(lag - best.lag) > guard) second = best.score;
+                best = { lag, score };
+            } else if (Math.abs(lag - best.lag) > guard && score > second) {
+                second = score;
+            }
+        }
+        const confidence = best.score > 0 && second > 0 ? best.score / second : 0;
+        return { delta: parseFloat((best.lag * bin).toFixed(3)), score: best.score, confidence, second };
+    }
+
+    async function fetchOfflineFingerprint(playlistUrl, startSec, windowSec) {
+        let segments = offlineAlignCache.playlists.get(playlistUrl);
+        if (!segments) {
+            const playlistText = await fetch(playlistUrl, { cache: 'force-cache' }).then(r => {
+                if (!r.ok) throw new Error(`playlist HTTP ${r.status}`);
+                return r.text();
+            });
+            segments = parseM3u8(playlistText, playlistUrl);
+            offlineAlignCache.playlists.set(playlistUrl, segments);
+        }
+        let t = 0;
+        const selected = [];
+        for (const seg of segments) {
+            const segStart = t;
+            const segEnd = t + seg.duration;
+            if (segEnd >= startSec && segStart <= startSec + windowSec) selected.push(seg);
+            t = segEnd;
+        }
+        if (selected.length < 4) throw new Error('可用 HLS 分片太少');
+        const frameGroups = await Promise.all(selected.map(async seg => {
+            const cached = offlineAlignCache.segmentFrames.get(seg.url);
+            if (cached) return cached;
+            const buffer = await fetch(seg.url, { cache: 'force-cache' }).then(r => {
+                if (!r.ok) throw new Error(`segment HTTP ${r.status}`);
+                return r.arrayBuffer();
+            });
+            const parsed = fingerprintTsSegments([buffer], seg.duration || 10);
+            offlineAlignCache.segmentFrames.set(seg.url, parsed);
+            return parsed;
+        }));
+        const frames = frameGroups.flat().sort((a, b) => a.t - b.t);
+        if (frames.length < 1000) throw new Error('AAC 指纹太短');
+        return { frames, selected: selected.length };
+    }
+
+    async function offlineFingerprintAlign(urls, currentTime, opts = {}) {
+        if (!urls || urls.length < 2) throw new Error('缺少双路 HLS 地址');
+        const windowSec = opts.windowSec || 120;
+        const searchSec = opts.searchSec || 90;
+        const maxApplyOffset = opts.maxApplyOffset == null ? 5 : opts.maxApplyOffset;
+        const starts = [
+            Math.max(0, currentTime - 60),
+            Math.max(0, currentTime + 120),
+            Math.max(0, currentTime + 300)
+        ];
+        const candidates = [];
+        for (let i = 0; i < starts.length; i++) {
+            const start = starts[i];
+            const [a, b] = await Promise.all([
+                fetchOfflineFingerprint(urls[0], start, windowSec),
+                fetchOfflineFingerprint(urls[1], start, windowSec)
+            ]);
+            const corr = correlateFingerprints(a.frames, b.frames, searchSec);
+            candidates.push({
+                start,
+                delta: corr.delta,
+                offset: parseFloat((-corr.delta).toFixed(2)),
+                score: corr.score,
+                confidence: corr.confidence,
+                frames1: a.frames.length,
+                frames2: b.frames.length,
+                segments1: a.selected,
+                segments2: b.selected
+            });
+        }
+        const good = candidates.filter(c => c.score > 0.42 && c.confidence > 1.06);
+        if (!good.length) {
+            const best = candidates.sort((a, b) => b.score - a.score)[0];
+            const suffix = best ? ` best ${best.offset >= 0 ? '+' : ''}${best.offset.toFixed(2)}s score ${best.score.toFixed(2)} conf ${best.confidence.toFixed(2)}` : '';
+            throw new Error('离线指纹置信度不足' + suffix);
+        }
+        const offsets = good.map(c => c.offset);
+        const minOffset = Math.min(...offsets);
+        const maxOffset = Math.max(...offsets);
+        if (maxOffset - minOffset > 0.75) {
+            throw new Error(`离线指纹不稳定 ${minOffset.toFixed(2)}s ~ ${maxOffset.toFixed(2)}s`);
+        }
+        const offset = parseFloat((good.reduce((sum, c) => sum + c.offset, 0) / good.length).toFixed(2));
+        if (Number.isFinite(maxApplyOffset) && Math.abs(offset) > maxApplyOffset) {
+            const best = good.sort((a, b) => b.score - a.score)[0];
+            throw new Error(`音频候选 ${offset >= 0 ? '+' : ''}${offset.toFixed(2)}s 过大，可能是音轨相对视频错位，未自动应用；best score ${best.score.toFixed(2)} conf ${best.confidence.toFixed(2)}`);
+        }
+        return {
+            delta: parseFloat((offset - state.syncOffset).toFixed(3)),
+            offset,
+            confidence: Math.min(...good.map(c => c.confidence)),
+            peak: Math.max(...good.map(c => c.score)),
+            rms1: 1,
+            rms2: 1,
+            method: 'aac-fingerprint',
+            candidates
+        };
+    }
+
+    function visualSimilarity(v1, v2) {
+        if (!v1 || !v2 || !v1.videoWidth || !v2.videoWidth) throw new Error('视频画面未就绪');
+        const w = 96;
+        const h = 54;
+        const canvas = document.createElement('canvas');
+        canvas.width = w * 2;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) throw new Error('Canvas 不可用');
+
+        // 老师视角里投影幕通常在右上区域；取稍大的区域，避免只截到边框。
+        const sx = Math.round(v1.videoWidth * 0.46);
+        const sy = Math.round(v1.videoHeight * 0.03);
+        const sw = Math.round(v1.videoWidth * 0.43);
+        const sh = Math.round(v1.videoHeight * 0.55);
+        ctx.drawImage(v1, sx, sy, sw, sh, 0, 0, w, h);
+        ctx.drawImage(v2, 0, 0, v2.videoWidth, v2.videoHeight, w, 0, w, h);
+        const a = ctx.getImageData(0, 0, w, h).data;
+        const b = ctx.getImageData(w, 0, w, h).data;
+        let mse = 0;
+        let edgeA = 0;
+        let edgeB = 0;
+        let edgeErr = 0;
+        const grayA = new Float32Array(w * h);
+        const grayB = new Float32Array(w * h);
+        for (let i = 0, p = 0; i < grayA.length; i++, p += 4) {
+            grayA[i] = (a[p] * 0.299 + a[p + 1] * 0.587 + a[p + 2] * 0.114) / 255;
+            grayB[i] = (b[p] * 0.299 + b[p + 1] * 0.587 + b[p + 2] * 0.114) / 255;
+            const d = grayA[i] - grayB[i];
+            mse += d * d;
+        }
+        mse /= grayA.length;
+        for (let y = 1; y < h; y++) {
+            for (let x = 1; x < w; x++) {
+                const i = y * w + x;
+                const ea = Math.abs(grayA[i] - grayA[i - 1]) + Math.abs(grayA[i] - grayA[i - w]);
+                const eb = Math.abs(grayB[i] - grayB[i - 1]) + Math.abs(grayB[i] - grayB[i - w]);
+                edgeA += ea;
+                edgeB += eb;
+                edgeErr += Math.abs(ea - eb);
+            }
+        }
+        const lumaScore = 1 / (1 + mse * 12);
+        const edgeScore = 1 / (1 + edgeErr / Math.max(1, Math.min(edgeA, edgeB)));
+        return parseFloat((lumaScore * 0.35 + edgeScore * 0.65).toFixed(6));
     }
 
 
     // 3. UI 渲染 (V30.0)
     function renderUI(urls) {
+        const oldRoot = document.getElementById('hsp-root-v20');
+        if (oldRoot) oldRoot.remove();
         // === Kill 官方播放器：脚本只是悬浮覆盖，官方jydH5Player仍在底层运行会自动播放 ===
         // 1. 只静音+暂停，不清空src/load()——避免触发emptied事件导致官方播放器重新初始化抢占AudioContext
         document.querySelectorAll('video').forEach(v => {
@@ -356,7 +997,7 @@ self.onmessage = function(e) {
             #hsp-stage { position: absolute; inset: 0; display:flex; justify-content:center; align-items:center; z-index:1; overflow:hidden;}
             video.hsp-video {
                 width: 100%; height: 100%; object-fit: contain; background: #000; outline: none;
-                transition: transform 0.3s; transform-origin: center center;
+                transition: none; transform-origin: center center;
             }
             video.hsp-video.stretch-mode { object-fit: fill !important; }
             video.hsp-video.crop-mode {
@@ -471,12 +1112,21 @@ self.onmessage = function(e) {
             input[type=range]:not(.prog-input)::-webkit-slider-thumb { -webkit-appearance: none; height: 12px; width: 12px; border-radius: 50%; background: #fff; margin-top: -4px; box-shadow: 0 2px 4px #000; transition: transform 0.1s;}
             input[type=range]:not(.prog-input)::hover::-webkit-slider-thumb { transform: scale(1.3); background: #00a8ff; }
 
-            .ctrl-grp { display: flex; flex-direction: column; gap: 2px; flex: 0.5; min-width: 40px; }
+            .ctrl-grp { display: flex; flex-direction: column; gap: 2px; flex: 0.5; min-width: 40px; position: relative; }
             .ctrl-header { display:flex; justify-content:space-between; align-items: center; font-size: 11px; color: #bbb; margin-bottom: 2px; }
             .ctrl-header > span:first-child { white-space: nowrap; flex-shrink: 0; }
             .ctrl-val { color: #00a8ff; font-weight: bold; flex-shrink: 0; }
-            .sync-input { background: transparent; border: none; color: #00a8ff; width: 30px; text-align: right; font-weight:bold; font-size:11px; padding:0; margin:0; height: 14px; line-height:14px; flex-shrink: 0; }
+            .sync-input { background: transparent; border: none; color: #00a8ff; width: 44px; text-align: right; font-weight:bold; font-size:11px; padding:0; margin:0; height: 14px; line-height:14px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
             .sync-unit { margin-left: 1px; line-height:14px; font-size:11px; color:#aaa; flex-shrink: 0; }
+            .sync-actions { display:flex; align-items:center; gap:5px; height:16px; flex-shrink:0; }
+            .sync-mini-btn { background:none; border:none; color:#bbb; cursor:pointer; font-size:11px; padding:0 2px; line-height:14px; height:16px; border-radius:4px; flex-shrink:0; }
+            .sync-mini-btn:hover { background: rgba(255,255,255,0.12); }
+            .sync-mini-btn.active { color:#6cffb5; font-weight:bold; }
+            .align-status { position:absolute; left:0; right:0; top:33px; color:#aaa; font-size:10px; line-height:12px; min-height:12px; max-height:24px; overflow:hidden; white-space:normal; overflow-wrap:anywhere; opacity:0; pointer-events:none; }
+            .align-status.show { opacity:0.78; }
+            #hsp-toast.toast-ok { color:#c8ffd8; border:1px solid rgba(108,255,181,0.35); }
+            #hsp-toast.toast-warn { color:#ffe7a5; border:1px solid rgba(255,210,90,0.35); }
+            #hsp-toast.toast-err { color:#ffb8b8; border:1px solid rgba(255,100,100,0.35); }
 
             .overlay-panel { position: absolute; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(8px); z-index: 900; display: none; align-items: center; justify-content: center; }
             .panel-card { background: #1e1e1e; width: 800px; padding: 25px; border-radius: 16px; border: 1px solid #444; max-height:85vh; overflow-y:auto; box-shadow: 0 20px 50px rgba(0,0,0,0.8); }
@@ -486,7 +1136,7 @@ self.onmessage = function(e) {
             .help-item ul { list-style: none; font-size: 13px; color: #ccc; line-height: 1.8; padding:0; }
             .help-item li { border-bottom: 1px dashed #333; padding-bottom: 4px; margin-bottom: 4px; }
             .help-item li b { color:#fff; background:#333; padding:2px 6px; border-radius:4px; font-size:12px; margin-right:6px; }
-            #hsp-toast { position: absolute; top: 100px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); padding: 8px 20px; border-radius: 20px; font-size: 14px; opacity: 0; pointer-events: none; transition: 0.3s; z-index: 500; }
+            #hsp-toast { position: absolute; top: 92px; left: 50%; transform: translateX(-50%); max-width: min(620px, calc(100vw - 32px)); background: rgba(18,18,20,0.72); border: 1px solid rgba(255,255,255,0.14); box-shadow: 0 8px 28px rgba(0,0,0,0.22); backdrop-filter: blur(18px) saturate(1.25); -webkit-backdrop-filter: blur(18px) saturate(1.25); padding: 9px 18px; border-radius: 18px; font-size: 14px; line-height: 18px; text-align:center; white-space:normal; overflow-wrap:anywhere; opacity: 0; pointer-events: none; transition: opacity 0.18s; z-index: 800; }
         `;
 
         const styleTag = document.createElement('style');
@@ -495,6 +1145,7 @@ self.onmessage = function(e) {
         root.innerHTML = `
             <div id="hsp-stage"></div>
             <div id="hsp-toast">提示</div>
+            <div id="hsp-debug-state" style="display:none;"></div>
 
             <div id="hsp-loading">
                 <div class="spinner"></div>
@@ -538,9 +1189,10 @@ self.onmessage = function(e) {
                             <ul>
                                 <li><b>独立音量</b> 两个滑块分别绑定视频源1和源2</li>
                                 <li><b>滚轮调音</b> 鼠标在主画面空白处滚动，快速调节主音量</li>
-                                <li><b>人声增强</b> 默认开启 5dB，集成高频降噪与动态压缩</li>
-                                <li><b>视角对齐</b> 0.0s 精度微调，解决主副画面不同步</li>
-                                <li><b>🎯自动对齐</b> 点击后采集8秒音频，互相关算法自动计算偏移。使用前提：① 在老师持续讲话的片段；② 已手动将偏差缩小至5秒以内，再点击🎯精确对齐</li>
+                                <li><b>人声增强</b> 默认开启 5dB，提升语音清晰度并保留动态压缩</li>
+                                <li><b>视角对齐</b> 先手动调到偏差约±10秒内，再用校准精修</li>
+                                <li><b>校准</b> 必须在有声片段使用，只在当前设置±10秒内取最佳值</li>
+                                <li><b>AUTO</b> 后台做同样的±10秒局部检测，结果稳定才小步修正</li>
                             </ul>
                         </div>
                         <div class="help-item">
@@ -578,12 +1230,14 @@ self.onmessage = function(e) {
                 <div class="ctrl-grp" style="flex:0.8;">
                     <div class="ctrl-header">
                         <span>视角对齐</span>
-                        <div style="display:flex;align-items:center;gap:3px;height:14px;">
-                            <input id="sync-input" class="sync-input" value="0.0"><span class="sync-unit">s</span>
-                            <button id="btn-auto-align" title="自动对齐：采集8秒音频波形互相关计算偏移" style="background:none;border:none;color:#00a8ff;cursor:pointer;font-size:11px;padding:0;line-height:14px;height:14px;flex-shrink:0;">🎯</button>
+                        <div class="sync-actions">
+                            <input id="sync-input" class="sync-input" value="0.00"><span class="sync-unit">s</span>
+                            <button id="btn-auto-align" class="sync-mini-btn" title="校准：只在当前对齐设置的 ±10 秒内精修">校准</button>
+                            <button id="btn-live-align" class="sync-mini-btn" title="自动校准：播放时周期检测并修正偏移">AUTO</button>
                         </div>
                     </div>
-                    <input type="range" id="sync-slider" min="-60" max="60" step="0.1" value="0">
+                    <input type="range" id="sync-slider" min="-120" max="120" step="0.1" value="0">
+                    <div id="align-status" class="align-status"></div>
                 </div>
 
                 <div class="ctrl-grp">
@@ -621,6 +1275,7 @@ self.onmessage = function(e) {
 
     // 4. 内核逻辑
     function initKernel(urls) {
+        const hasDual = urls.length > 1;
         const v1 = document.createElement('video'); v1.className = 'hsp-video'; v1.id = 'hsp-v1'; v1.crossOrigin = "anonymous";
         const v2 = document.createElement('video'); v2.className = 'hsp-video'; v2.id = 'hsp-v2'; v2.crossOrigin = "anonymous";
 
@@ -628,33 +1283,70 @@ self.onmessage = function(e) {
         document.getElementById('hsp-pip').appendChild(v2);
 
         const hlsConfig = {
-            maxBufferLength: 60,
-            maxMaxBufferLength: 600,
+            maxBufferLength: 120,
+            maxMaxBufferLength: 900,
+            backBufferLength: 120,
             enableWorker: true,
-            lowLatencyMode: true
+            lowLatencyMode: false,
+            fragLoadingTimeOut: 30000,
+            fragLoadingMaxRetry: 8,
+            fragLoadingRetryDelay: 1000,
+            manifestLoadingTimeOut: 30000,
+            manifestLoadingMaxRetry: 6,
+            manifestLoadingRetryDelay: 1000
         };
         const hls1 = new Hls(hlsConfig);
-        const hls2 = new Hls(hlsConfig);
+        const hls2 = hasDual ? new Hls(hlsConfig) : null;
 
         // 只保留当前播放时间附近的片段，快进后自动使用新数据
         const load = (hls, v, url) => {
-            if(Hls.isSupported()) { hls.loadSource(url); hls.attachMedia(v); }
+            if(Hls.isSupported()) {
+                hls.loadSource(url);
+                hls.attachMedia(v);
+                hls.on(Hls.Events.ERROR, (_, data) => {
+                    if (!data || !data.fatal) return;
+                    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                        hls.startLoad();
+                    } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                        hls.recoverMediaError();
+                    } else {
+                        console.warn('[HSP] Fatal HLS error, unable to recover', data);
+                    }
+                });
+            }
             else { v.src = url; }
         };
         load(hls1, v1, urls[0]);
-        if (urls.length > 1) { load(hls2, v2, urls[1]); v2.volume = 0; }
-        else { document.getElementById('hsp-pip').style.display = 'none'; }
+        if (hasDual) { load(hls2, v2, urls[1]); v2.volume = 0; }
+        else {
+            state.isPipVisible = false;
+            document.getElementById('hsp-pip').style.display = 'none';
+        }
 
         const unlockAudio = () => {
-            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            if (audioCtx.state === 'suspended') audioCtx.resume();
-            setupAudioNode(v1, 'v1'); setupAudioNode(v2, 'v2');
-            updateAudioState(v1, v2);
+            try {
+                if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+                setupAudioNode(v1, 'v1');
+                if (hasDual) setupAudioNode(v2, 'v2');
+                if (hasDual) ensureAudioCapture();
+                updateAudioState(v1, hasDual ? v2 : null);
+            } catch(e) {
+                console.warn('[HSP] Audio unlock failed, native volume fallback active', e);
+            }
             document.removeEventListener('click', unlockAudio);
         };
+        const resumeAudio = () => {
+            try {
+                if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+                updateAudioState(v1, hasDual ? v2 : null);
+            } catch(e) {}
+        };
         document.addEventListener('click', unlockAudio);
+        document.addEventListener('visibilitychange', resumeAudio);
+        [v1, v2].forEach(v => v.addEventListener('play', resumeAudio));
 
-        bindEvents(v1, v2, hls1, hls2);
+        bindEvents(v1, v2, hls1, hls2, hasDual, urls);
         initResizeLogic();
         initIdleBehavior(); // 启动闲置检测
     }
@@ -710,13 +1402,375 @@ self.onmessage = function(e) {
         resetIdle();
     }
 
-    function bindEvents(v1, v2, hls1, hls2) {
-        let master = v1; let slave = v2;
+    function bindEvents(v1, v2, hls1, hls2, hasDual, urls) {
+        let master = v1; let slave = hasDual ? v2 : null;
         const loader = document.getElementById('hsp-loading');
-        const showToast = (msg) => {
+        let syncHoldUntil = 0;
+        let lastBufferUiAt = 0;
+        let liveAlignBusy = false;
+        let liveAlignStable = [];
+        let alignStatusHideTimer = null;
+        let lastCalibrationAt = 0;
+        let lastCalibrationSamples = null;
+        let lastCalibrationTarget = null;
+        let lastMasterTime = null;
+        let lastMasterStamp = 0;
+        let toastHideTimer = null;
+        let toastProtectUntil = 0;
+        const showToast = (msg, type = '', duration = 1500, options = {}) => {
+            const now = Date.now();
+            if (!options.force && !options.protect && now < toastProtectUntil) return;
             const t = document.getElementById('hsp-toast');
+            t.classList.remove('toast-ok', 'toast-warn', 'toast-err');
+            if (type) t.classList.add(`toast-${type}`);
             t.textContent = msg; t.style.opacity = 1;
-            setTimeout(() => t.style.opacity = 0, 1500);
+            if (options.protect) toastProtectUntil = now + duration;
+            clearTimeout(toastHideTimer);
+            toastHideTimer = setTimeout(() => t.style.opacity = 0, duration);
+        };
+        const writeDebugState = () => {
+            const el = document.getElementById('hsp-debug-state');
+            if (!el) return;
+            el.textContent = JSON.stringify({
+                version: '61.0',
+                syncOffset: state.syncOffset,
+                realtimeAlign: state.realtimeAlign,
+                alignStatus: state.alignStatus,
+                lastAlign: state.lastAlign,
+                masterId: master && master.id,
+                slaveId: slave && slave.id,
+                streams: urls
+            });
+        };
+        const setAlignStatus = (msg, type = '') => {
+            state.alignStatus = msg;
+            const el = document.getElementById('align-status');
+            if (el) {
+                el.textContent = msg;
+                el.style.color = type === 'err' ? '#ffb8b8' : '#aaa';
+                const visible = state.realtimeAlign || type === 'warn' || type === 'err' || type === 'ok';
+                el.classList.toggle('show', !!msg && visible);
+                clearTimeout(alignStatusHideTimer);
+                if (!state.realtimeAlign && (type === 'ok' || type === 'warn')) {
+                    alignStatusHideTimer = setTimeout(() => el.classList.remove('show'), 3500);
+                }
+            }
+            if (runtime.current) runtime.current.alignStatus = msg;
+            writeDebugState();
+        };
+
+        const safePlay = (v) => v ? v.play().catch(()=>{}) : Promise.resolve();
+        const safeDuration = (v) => {
+            if (!v) return 1;
+            if (Number.isFinite(v.duration) && v.duration > 0) return v.duration;
+            try {
+                if (v.seekable && v.seekable.length > 0) {
+                    const end = v.seekable.end(v.seekable.length - 1);
+                    if (Number.isFinite(end) && end > 0) return end;
+                }
+            } catch(e) {}
+            return 1;
+        };
+        const pairOffset = () => (hasDual && state.isSwapped) ? -state.syncOffset : state.syncOffset;
+        const clampMediaTime = (v, time) => {
+            if (!Number.isFinite(time)) return 0;
+            const d = safeDuration(v);
+            return Math.max(0, Math.min(time, d > 1 ? d - 0.05 : time));
+        };
+        const applyBaseRate = () => {
+            master.playbackRate = state.rate;
+            if (slave) slave.playbackRate = state.rate;
+        };
+        const writeSync = (value, immediate = true) => {
+            const parsed = parseFloat(value);
+            state.syncOffset = Number.isFinite(parsed) ? parsed : 0;
+            const syncIn = document.getElementById('sync-input');
+            const syncSl = document.getElementById('sync-slider');
+            if (syncIn) syncIn.value = state.syncOffset.toFixed(2);
+            if (syncSl) syncSl.value = state.syncOffset;
+            if (immediate) syncSlaveNow(0.05);
+            writeDebugState();
+        };
+        const syncSlaveNow = (threshold = 0.25) => {
+            if (!hasDual || !slave || !Number.isFinite(master.currentTime)) return;
+            const target = clampMediaTime(slave, master.currentTime + pairOffset());
+            const drift = slave.currentTime - target;
+
+            if (Math.abs(drift) > threshold) {
+                syncHoldUntil = Date.now() + 500;
+                slave.currentTime = target;
+                slave.playbackRate = state.rate;
+                return;
+            }
+
+            if (!master.paused && !slave.paused && Math.abs(drift) > 0.06 && Date.now() > syncHoldUntil) {
+                const correction = Math.max(-0.08, Math.min(0.08, -drift * 0.18));
+                slave.playbackRate = Math.max(0.25, Math.min(4, state.rate + correction));
+            } else if (slave.playbackRate !== state.rate) {
+                slave.playbackRate = state.rate;
+            }
+        };
+        const seekBoth = (time) => {
+            const t = clampMediaTime(master, time);
+            clearAudioCapture();
+            liveAlignStable = [];
+            lastCalibrationAt = 0;
+            lastCalibrationSamples = null;
+            lastCalibrationTarget = null;
+            lastMasterTime = null;
+            syncHoldUntil = Date.now() + 1200;
+            master.currentTime = t;
+            if (slave) slave.currentTime = clampMediaTime(slave, t + pairOffset());
+            setAlignStatus(state.realtimeAlign ? '实时对齐等待新音频' : '已跳转，等待新音频');
+        };
+        const applyAlignDelta = (detail, source) => {
+            const baseOffset = Number.isFinite(detail.baseOffset) ? detail.baseOffset : state.syncOffset;
+            const targetOffset = Number.isFinite(detail.targetOffset) ? detail.targetOffset : baseOffset + detail.delta;
+            const newOffset = parseFloat(targetOffset.toFixed(2));
+            writeSync(newOffset);
+            const msg = `${source}: ${newOffset >= 0 ? '+' : ''}${newOffset.toFixed(2)}s`;
+            setAlignStatus(msg, 'ok');
+            return newOffset;
+        };
+        const maybeLiveAlign = () => {
+            if (!state.realtimeAlign || liveAlignBusy || !hasDual || !slave || master.paused || slave.paused) return;
+            if (Date.now() - lastCalibrationAt < 15000) {
+                setAlignStatus('AUTO 暂停片刻，保留刚才校准', '');
+                return;
+            }
+            if (master.readyState < 3 || slave.readyState < 3) {
+                setAlignStatus('实时对齐等待缓冲', 'warn');
+                return;
+            }
+            liveAlignBusy = true;
+            autoAlign(v1, v2,
+                detail => {
+                    liveAlignBusy = false;
+                    liveAlignStable.push(detail);
+                    if (liveAlignStable.length > 2) liveAlignStable.shift();
+                    if (Math.abs(detail.delta) < 0.06) {
+                        setAlignStatus('AUTO 已稳定', '');
+                        return;
+                    }
+                    const stable = liveAlignStable.length >= 2 && liveAlignStable.every(d => Math.abs(d.delta - detail.delta) < 0.35);
+                    if (!stable) {
+                        setAlignStatus(`AUTO 观察 ${detail.delta >= 0 ? '+' : ''}${detail.delta.toFixed(2)}s`, '');
+                        return;
+                    }
+                    const limitedDelta = Math.max(-1.2, Math.min(1.2, detail.delta));
+                    const limited = Object.assign({}, detail, {
+                        delta: limitedDelta,
+                        targetOffset: parseFloat(((Number.isFinite(detail.baseOffset) ? detail.baseOffset : state.syncOffset) + limitedDelta).toFixed(3))
+                    });
+                    const newOffset = applyAlignDelta(limited, '实时对齐');
+                    showToast(`AUTO ${newOffset >= 0 ? '+' : ''}${newOffset.toFixed(2)}s`, 'ok');
+                },
+                (errMsg, detail) => {
+                    liveAlignBusy = false;
+                    liveAlignStable = [];
+                    setAlignStatus(/声音太弱|采集数据不足/.test(errMsg) ? 'AUTO 等待有声片段' : `AUTO ${errMsg}`, 'warn');
+                },
+                { sampleDur: 30, minSampleDur: 5.5, searchSec: 10, minRms: 0.001, minConfidence: 1.04, minPeak: 0.015, maxAbsDelta: 9.8, projectHistory: true }
+            );
+        };
+        const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+        const shouldTryWideAlign = (errMsg, detail) => {
+            const msg = String(errMsg || '');
+            if (/声音太弱|采集数据不足|音频引擎未就绪|音频采集未就绪/.test(msg)) return false;
+            if (/搜索边界/.test(msg)) return true;
+            if (Math.abs(state.syncOffset) >= 8) return true;
+            if (detail && Math.abs(detail.delta || 0) >= 2.5) return true;
+            return false;
+        };
+        const visualAlignSearch = async () => {
+            const baseTime = clampMediaTime(v1, v1.currentTime);
+            const originalOffset = state.syncOffset;
+            const wasPlaying = !master.paused;
+            v1.pause();
+            if (v2) v2.pause();
+
+            const scoreAt = async (offset) => {
+                v1.currentTime = baseTime;
+                v2.currentTime = clampMediaTime(v2, baseTime + offset);
+                await wait(550);
+                const score = visualSimilarity(v1, v2);
+                return { offset: parseFloat(offset.toFixed(2)), score };
+            };
+
+            const candidates = [];
+            for (let o = -36; o <= 36; o += 6) candidates.push(o);
+            if (!candidates.some(o => Math.abs(o - originalOffset) < 0.1)) candidates.push(originalOffset);
+            let results = [];
+            for (let i = 0; i < candidates.length; i++) {
+                setAlignStatus(`视觉搜索 ${i + 1}/${candidates.length}: ${candidates[i].toFixed(0)}s`, 'warn');
+                try { results.push(await scoreAt(candidates[i])); } catch(e) {}
+            }
+            results.sort((a, b) => b.score - a.score);
+            if (!results.length) throw new Error('视觉搜索失败：无法读取视频帧');
+
+            const coarseBest = results[0];
+            const refine = [];
+            for (let o = coarseBest.offset - 5; o <= coarseBest.offset + 5; o += 1) refine.push(o);
+            const refineResults = [];
+            for (let i = 0; i < refine.length; i++) {
+                setAlignStatus(`视觉精搜 ${i + 1}/${refine.length}: ${refine[i].toFixed(1)}s`, 'warn');
+                try { refineResults.push(await scoreAt(refine[i])); } catch(e) {}
+            }
+            results = results.concat(refineResults).sort((a, b) => b.score - a.score);
+            const best = results[0];
+            const second = results.find(r => Math.abs(r.offset - best.offset) > 2.5) || results[1] || best;
+            const margin = best.score - second.score;
+            const detail = {
+                method: 'visual-projector',
+                offset: best.offset,
+                delta: parseFloat((best.offset - originalOffset).toFixed(3)),
+                confidence: parseFloat((best.score / Math.max(0.0001, second.score)).toFixed(3)),
+                peak: best.score,
+                margin,
+                candidates: results.slice(0, 12)
+            };
+            state.lastAlign = detail;
+
+            if (best.score < 0.54 || margin < 0.018) {
+                writeSync(originalOffset);
+                v1.currentTime = baseTime;
+                v2.currentTime = clampMediaTime(v2, baseTime + originalOffset);
+                if (wasPlaying) { safePlay(v1); safePlay(v2); }
+                throw new Error(`视觉结果不明确 best ${best.score.toFixed(2)} margin ${margin.toFixed(3)}`);
+            }
+
+            writeSync(best.offset);
+            v1.currentTime = baseTime;
+            v2.currentTime = clampMediaTime(v2, baseTime + best.offset);
+            clearAudioCapture();
+            if (wasPlaying) { safePlay(v1); safePlay(v2); }
+            setAlignStatus(`视觉对齐: ${best.offset >= 0 ? '+' : ''}${best.offset.toFixed(2)}s score ${best.score.toFixed(2)}`, 'ok');
+            return detail;
+        };
+        const wideAlignSearch = async () => {
+            const baseV1 = clampMediaTime(v1, v1.currentTime);
+            const wasPlaying = !master.paused;
+            const originalOffset = state.syncOffset;
+            const candidates = [];
+            const addCandidate = v => {
+                const c = Math.max(-60, Math.min(60, parseFloat(v.toFixed(2))));
+                if (!candidates.some(x => Math.abs(x - c) < 0.01)) candidates.push(c);
+            };
+            [-32, -24, -16, -8, 0, 8, 16, 24, 32].forEach(d => addCandidate(originalOffset + d));
+
+            const scoreCandidate = async (offset, sampleDur = 1.4, baseTime = baseV1, strict = false) => {
+                clearAudioCapture();
+                const targetV1 = clampMediaTime(v1, baseTime);
+                const targetV2 = targetV1 + offset;
+                const clampedV2 = clampMediaTime(v2, targetV2);
+                if (Math.abs(clampedV2 - targetV2) > 0.5) {
+                    return { ok: false, offset, errMsg: '候选偏移超出视频范围', score: 0 };
+                }
+                v1.currentTime = targetV1;
+                v2.currentTime = clampedV2;
+                await wait(350);
+                await Promise.all([safePlay(v1), safePlay(v2)]);
+                await wait(Math.ceil(sampleDur * 1000) + 350);
+                return new Promise(resolve => {
+                    autoAlign(v1, v2,
+                        detail => resolve({ ok: true, offset: parseFloat((offset + detail.delta).toFixed(2)), detail, score: detail.confidence * detail.peak }),
+                        (errMsg, detail) => resolve({ ok: false, offset, detail, errMsg, score: detail ? detail.confidence * detail.peak : 0 }),
+                        {
+                            sampleDur,
+                            searchSec: 0.9,
+                            minConfidence: strict ? 1.65 : 1.45,
+                            minPeak: strict ? 0.11 : 0.10,
+                            maxAbsDelta: 0.95
+                        }
+                    );
+                });
+            };
+
+            let best = null;
+            const successful = [];
+            for (let i = 0; i < candidates.length; i++) {
+                setAlignStatus(`大范围搜索 ${i + 1}/${candidates.length}: ${candidates[i].toFixed(0)}s`, 'warn');
+                const result = await scoreCandidate(candidates[i], 1.2);
+                if (result.ok) {
+                    successful.push(result);
+                    if (!best || result.score > best.score) best = result;
+                }
+            }
+            if (best) {
+                const refineList = [];
+                for (let d = -6; d <= 6; d += 2) {
+                    const c = Math.max(-60, Math.min(60, parseFloat((best.offset + d).toFixed(2))));
+                    if (!refineList.some(x => Math.abs(x - c) < 0.01)) refineList.push(c);
+                }
+                for (let i = 0; i < refineList.length; i++) {
+                    setAlignStatus(`精细搜索 ${i + 1}/${refineList.length}: ${refineList[i].toFixed(1)}s`, 'warn');
+                    const result = await scoreCandidate(refineList[i], 1.5);
+                    if (result.ok) {
+                        successful.push(result);
+                        if (result.score > best.score) best = result;
+                    }
+                }
+            }
+
+            const verifyWideCandidate = async (candidate, rank) => {
+                const offsets = [];
+                const scores = [];
+                const details = [];
+                const checkPoints = [baseV1, baseV1 + 8, baseV1 + 16];
+                for (let i = 0; i < checkPoints.length; i++) {
+                    setAlignStatus(`验证候选 ${rank}: ${candidate.offset.toFixed(2)}s (${i + 1}/${checkPoints.length})`, 'warn');
+                    const result = await scoreCandidate(candidate.offset, 2.2, checkPoints[i], true);
+                    if (!result.ok) continue;
+                    offsets.push(result.offset);
+                    scores.push(result.score);
+                    details.push(result.detail);
+                }
+                if (offsets.length < 2) return null;
+                const min = Math.min(...offsets);
+                const max = Math.max(...offsets);
+                if (max - min > 0.55) return null;
+                const offset = parseFloat((offsets.reduce((a, b) => a + b, 0) / offsets.length).toFixed(2));
+                const score = scores.reduce((a, b) => a + b, 0) / scores.length;
+                const detail = Object.assign({}, details[details.length - 1], {
+                    confidence: Math.min(...details.map(d => d.confidence || 0)),
+                    peak: Math.min(...details.map(d => d.peak || 0))
+                });
+                return { ok: true, offset, detail, score };
+            };
+
+            if (successful.length) {
+                const top = successful
+                    .sort((a, b) => b.score - a.score)
+                    .filter((item, idx, arr) => arr.findIndex(x => Math.abs(x.offset - item.offset) < 0.75) === idx)
+                    .slice(0, 3);
+                best = null;
+                for (let i = 0; i < top.length; i++) {
+                    const verified = await verifyWideCandidate(top[i], i + 1);
+                    if (verified && (!best || verified.score > best.score)) best = verified;
+                }
+            } else {
+                best = null;
+            }
+
+            if (!best) {
+                writeSync(originalOffset);
+                v1.currentTime = baseV1;
+                v2.currentTime = clampMediaTime(v2, baseV1 + originalOffset);
+                if (wasPlaying) { safePlay(v1); safePlay(v2); }
+                else { v1.pause(); v2.pause(); }
+                throw new Error('大范围搜索失败：没有找到跨时间点稳定的音频重合点');
+            }
+
+            writeSync(best.offset);
+            v1.currentTime = baseV1;
+            v2.currentTime = clampMediaTime(v2, baseV1 + best.offset);
+            clearAudioCapture();
+            if (wasPlaying) { safePlay(v1); safePlay(v2); }
+            else { v1.pause(); v2.pause(); }
+            best.detail.delta = parseFloat((best.offset - originalOffset).toFixed(3));
+            state.lastAlign = best.detail;
+            setAlignStatus(`大范围对齐: ${best.offset >= 0 ? '+' : ''}${best.offset.toFixed(2)}s conf ${best.detail.confidence.toFixed(2)}`, 'ok');
+            return best;
         };
 
         const applyVideoStyles = () => {
@@ -739,13 +1793,21 @@ self.onmessage = function(e) {
             if (shouldCrop) {
                 const rect = pip.getBoundingClientRect();
                 if (!pip.dataset.cropped) {
+                    pip.dataset.preCropWidth = pip.style.width || `${rect.width}px`;
+                    pip.dataset.preCropHeight = pip.style.height || `${rect.height}px`;
                     pip.style.width = (rect.height * 1.333) + 'px';
                     pip.dataset.cropped = "true";
                 }
                 slaveEl.classList.add('crop-mode');
             } else {
                 slaveEl.classList.remove('crop-mode');
+                if (pip.dataset.cropped) {
+                    if (pip.dataset.preCropWidth) pip.style.width = pip.dataset.preCropWidth;
+                    if (pip.dataset.preCropHeight) pip.style.height = pip.dataset.preCropHeight;
+                }
                 delete pip.dataset.cropped;
+                delete pip.dataset.preCropWidth;
+                delete pip.dataset.preCropHeight;
             }
 
             document.getElementById('btn-stretch-main').classList.toggle('h-btn-act', state.isStretchMain);
@@ -761,16 +1823,20 @@ self.onmessage = function(e) {
         };
 
         document.getElementById('btn-swap').onclick = () => {
+            if (!hasDual) { showToast("当前只有一路视频"); return; }
             state.isSwapped = !state.isSwapped;
             const stage = document.getElementById('hsp-stage');
             const pip = document.getElementById('hsp-pip');
             if (state.isSwapped) { stage.appendChild(v2); pip.appendChild(v1); master=v2; slave=v1; }
             else { stage.appendChild(v1); pip.appendChild(v2); master=v1; slave=v2; }
+            applyBaseRate();
+            syncSlaveNow(0.05);
             applyVideoStyles();
-            showToast("视角已交换");
+            showToast("视角已交换", 'ok');
         };
 
         document.getElementById('btn-toggle-pip').onclick = function() {
+            if (!hasDual) { showToast("当前只有一路视频"); return; }
             state.isPipVisible = !state.isPipVisible;
             document.getElementById('hsp-pip').style.display = state.isPipVisible ? 'block' : 'none';
             if (state.isPipVisible) { this.classList.add('h-btn-act'); this.classList.remove('h-btn-dim'); }
@@ -780,10 +1846,11 @@ self.onmessage = function(e) {
         document.getElementById('btn-stretch-main').onclick = () => {
             state.isStretchMain = !state.isStretchMain;
             applyVideoStyles();
-            showToast(state.isStretchMain?"主画面: 强制拉伸":"主画面: 保持比例");
+            showToast(state.isStretchMain?"主画面: 强制拉伸":"主画面: 保持比例", 'ok');
         };
 
         document.getElementById('btn-crop-sub').onclick = () => {
+            if (!hasDual) { showToast("当前只有一路视频"); return; }
             if (state.isSwapped) {
                 state.isCropV1 = !state.isCropV1;
             } else {
@@ -793,31 +1860,60 @@ self.onmessage = function(e) {
         };
 
         const btnPlay = document.getElementById('btn-play');
+        let bufferHoldActive = false;
+        let bufferHoldWasPlaying = false;
         const checkBuffer = () => {
-            const buffering = (master.readyState < 3 && !master.paused) || (slave.readyState < 3 && !slave.paused && state.isPipVisible);
+            const wantsPlayback = btnPlay.textContent === '❚❚' || bufferHoldActive;
+            const buffering = wantsPlayback && ((master.readyState < 3) || (hasDual && slave.readyState < 3 && state.isPipVisible));
             loader.style.display = buffering ? 'flex' : 'none';
             if (buffering) {
-                if(master.readyState >= 3) master.pause();
-                if(slave.readyState >= 3) slave.pause();
+                if (!bufferHoldActive) {
+                    bufferHoldActive = true;
+                    bufferHoldWasPlaying = btnPlay.textContent === '❚❚' || !master.paused || (hasDual && slave && !slave.paused);
+                }
+                master.pause();
+                if (hasDual && slave) slave.pause();
             } else {
-                if (btnPlay.textContent === '❚❚') {
-                    if (master.paused) master.play();
-                    if (slave.paused) slave.play();
+                if (bufferHoldActive && bufferHoldWasPlaying) {
+                    bufferHoldActive = false;
+                    syncHoldUntil = Date.now() + 900;
+                    syncSlaveNow(0.05);
+                    if (master.paused) safePlay(master);
+                    if (hasDual && slave.paused) safePlay(slave).then(() => syncSlaveNow(0.08));
+                } else if (bufferHoldActive) {
+                    bufferHoldActive = false;
                 }
             }
         };
-        [v1, v2].forEach(v => {
+        [v1, v2].filter(v => hasDual || v === v1).forEach(v => {
             v.addEventListener('waiting', checkBuffer);
             v.addEventListener('canplay', checkBuffer);
             v.addEventListener('playing', checkBuffer);
+            v.addEventListener('seeking', () => {
+                if (v === master && Date.now() > syncHoldUntil) {
+                    clearAudioCapture();
+                    liveAlignStable = [];
+                    lastMasterTime = null;
+                    setAlignStatus(state.realtimeAlign ? 'AUTO 等待新位置声音' : '', '');
+                }
+            });
+            v.addEventListener('seeked', () => {
+                if (v === master) {
+                    clearAudioCapture();
+                    liveAlignStable = [];
+                    lastMasterTime = master.currentTime;
+                    lastMasterStamp = Date.now();
+                }
+                syncSlaveNow(0.08);
+            });
         });
 
         const toggle = () => {
             if (master.paused) {
-                master.play().catch(()=>{}); slave.play().catch(()=>{});
+                safePlay(master); if (slave) safePlay(slave).then(() => syncSlaveNow(0.08));
                 btnPlay.textContent = '❚❚';
             } else {
-                master.pause(); slave.pause();
+                master.pause(); if (slave) slave.pause();
                 btnPlay.textContent = '▶';
             }
         };
@@ -828,7 +1924,10 @@ self.onmessage = function(e) {
         const barPlayed = document.getElementById('bar-played');
 
         const updateBufferUI = () => {
-            let d = master.duration; if(!Number.isFinite(d)) d=master.seekable.end(0) || 1;
+            const now = Date.now();
+            if (now - lastBufferUiAt < 800) return;
+            lastBufferUiAt = now;
+            const d = safeDuration(master);
             const currentBuffered = [];
             for(let i=0; i<master.buffered.length; i++) {
                 currentBuffered.push([master.buffered.start(i), master.buffered.end(i)]);
@@ -855,8 +1954,20 @@ self.onmessage = function(e) {
         };
 
         const updateTick = () => {
-            let d = master.duration; if(!Number.isFinite(d)) d=master.seekable.end(0) || 1;
+            const d = safeDuration(master);
             const c = master.currentTime;
+            const now = Date.now();
+            if (lastMasterTime != null && lastMasterStamp) {
+                const elapsed = (now - lastMasterStamp) / 1000;
+                const expected = elapsed * Math.max(0.1, state.rate);
+                if (Math.abs((c - lastMasterTime) - expected) > 2.0 && now > syncHoldUntil) {
+                    clearAudioCapture();
+                    liveAlignStable = [];
+                    setAlignStatus(state.realtimeAlign ? 'AUTO 等待新位置声音' : '', '');
+                }
+            }
+            lastMasterTime = c;
+            lastMasterStamp = now;
 
             const pct = (c/d)*100;
             if(Math.abs(seekBar.value-pct)>0.5) seekBar.value = pct;
@@ -865,18 +1976,28 @@ self.onmessage = function(e) {
 
             updateBufferUI();
 
-            const tgt = c + state.syncOffset;
-            if (Math.abs(slave.currentTime - tgt) > 0.5) {
-                slave.currentTime = tgt;
-            }
+            syncSlaveNow();
         };
-        master.ontimeupdate = updateTick; slave.ontimeupdate = ()=>{if(state.isSwapped)updateTick()};
+        master.ontimeupdate = updateTick;
+        if (slave) slave.ontimeupdate = ()=>{if(state.isSwapped)updateTick()};
         master.addEventListener('progress', updateBufferUI);
+        runtime.timers.push(setInterval(() => syncSlaveNow(), 500));
+        runtime.timers.push(setInterval(maybeLiveAlign, 6000));
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                if (slave) slave.playbackRate = state.rate;
+                return;
+            }
+            applyBaseRate();
+            syncHoldUntil = Date.now() + 900;
+            syncSlaveNow(0.05);
+            checkBuffer();
+        });
 
         seekBar.oninput = e => {
-            let d = master.duration; if(!Number.isFinite(d)) d=master.seekable.end(0);
+            const d = safeDuration(master);
             const t = (e.target.value/100)*(d||1);
-            master.currentTime=t; slave.currentTime=t+state.syncOffset;
+            seekBoth(t);
         };
 
         document.getElementById('vol-1').oninput = e => { state.vol1=e.target.value; document.getElementById('txt-v1').textContent=Math.round(e.target.value*100)+'%'; updateAudioState(v1,v2); };
@@ -894,55 +2015,147 @@ self.onmessage = function(e) {
         });
 
         document.getElementById('vocal-slider').oninput = e => {
-            state.vocalGain=e.target.value;
+            state.vocalGain=parseFloat(e.target.value);
             document.getElementById('txt-vocal').textContent = state.vocalGain > 0 ? `+${state.vocalGain}dB` : "OFF";
             updateAudioState(v1,v2);
         };
-
         const syncIn=document.getElementById('sync-input'), syncSl=document.getElementById('sync-slider');
-        const setSync=v=>{state.syncOffset=parseFloat(v);syncIn.value=state.syncOffset.toFixed(1);syncSl.value=state.syncOffset;};
-        syncIn.onchange=e=>setSync(e.target.value); syncSl.oninput=e=>setSync(e.target.value);
+        const setSync=v=>{
+            writeSync(v);
+            liveAlignStable = [];
+            lastCalibrationAt = 0;
+            lastCalibrationSamples = null;
+            lastCalibrationTarget = null;
+            setAlignStatus(`同步: ${state.syncOffset >= 0 ? '+' : ''}${state.syncOffset.toFixed(2)}s`);
+        };
+        syncIn.oninput=e=>setSync(e.target.value);
+        syncIn.onchange=e=>setSync(e.target.value);
+        syncSl.oninput=e=>setSync(e.target.value);
 
         // 自动对齐按钮
         const btnAutoAlign = document.getElementById('btn-auto-align');
+        const searchableWindow = () => {
+            const available = Math.min(projectedAudioSeconds(state.syncOffset), 121);
+            return Math.max(0, Math.min(10, available - 0.5));
+        };
+        const resetAutoAlignButton = () => {
+            btnAutoAlign.disabled = false;
+            btnAutoAlign.style.opacity = '1';
+            btnAutoAlign.title = '校准：只在当前对齐设置的 ±10 秒内精修';
+        };
+        const showLocalAlignGuide = (mode) => {
+            setAlignStatus(mode === 'AUTO' ? 'AUTO: ±10s局部修正' : '校准: ±10s局部精修', 'warn');
+            showToast('使用前提：先手动把两路调到±10秒内，并且当前片段要有老师声音', 'warn', 5600, { protect: true });
+        };
+        const runClassicCalibration = () => {
+            autoAlign(v1, v2,
+                detail => {
+                    const newOffset = applyAlignDelta(detail, '校准');
+                    lastCalibrationAt = Date.now();
+                    liveAlignStable = [];
+                    if (!lastCalibrationSamples || Math.abs(detail.delta) > 0.15) {
+                        lastCalibrationSamples = captureTotals();
+                        lastCalibrationTarget = newOffset;
+                    }
+                    showToast(`已校准 ${newOffset >= 0 ? '+' : ''}${newOffset.toFixed(2)}s`, 'ok');
+                    resetAutoAlignButton();
+                },
+                (errMsg, detail) => {
+                    const suffix = detail && detail.confidence ? ` conf ${detail.confidence.toFixed(2)}` : '';
+                    setAlignStatus(errMsg + suffix, 'warn');
+                    showToast('⚠️ ' + errMsg + suffix, 'warn');
+                    resetAutoAlignButton();
+                },
+                {
+                    sampleDur: 30,
+                    minSampleDur: 5.5,
+                    searchSec: 10,
+                    minSearchSec: 5,
+                    minRms: 0.001,
+                    maxAbsDelta: 10.1,
+                    silenceOnlyValidation: true,
+                    projectHistory: true
+                }
+            );
+        };
         btnAutoAlign.onclick = () => {
+            if (!hasDual) { showToast("当前只有一路视频"); return; }
             if (btnAutoAlign.disabled) return;
             btnAutoAlign.disabled = true;
             btnAutoAlign.style.opacity = '0.5';
             btnAutoAlign.title = '分析中…';
-            showToast('🎯 采集音频中，请保持播放（约8秒）…');
-
-            autoAlign(v1, v2,
-                (delta) => {
-                    // delta是在当前syncOffset基础上的修正量，叠加而非替换
-                    const newOffset = parseFloat((state.syncOffset + delta).toFixed(2));
-                    setSync(newOffset);
-                    // 立即应用到slave
-                    const tgt = master.currentTime + newOffset;
-                    if (Math.abs(slave.currentTime - tgt) > 0.05) slave.currentTime = tgt;
-                    showToast(`🎯 自动对齐完成：修正${delta >= 0 ? '+' : ''}${delta.toFixed(2)}s → 总偏移${newOffset >= 0 ? '+' : ''}${newOffset.toFixed(2)}s`);
-                    btnAutoAlign.disabled = false;
-                    btnAutoAlign.style.opacity = '1';
-                    btnAutoAlign.title = '自动对齐：采集8秒音频波形互相关计算偏移';
-                },
-                (errMsg) => {
-                    showToast('⚠️ ' + errMsg);
-                    btnAutoAlign.disabled = false;
-                    btnAutoAlign.style.opacity = '1';
-                    btnAutoAlign.title = '自动对齐：采集8秒音频波形互相关计算偏移';
-                }
-            );
+            if (master.paused || slave.paused) {
+                showLocalAlignGuide('校准');
+                resetAutoAlignButton();
+                return;
+            }
+            const win = searchableWindow();
+            if (state.lastAlign && Date.now() - lastCalibrationAt < 3000 && Math.abs((state.lastAlign.targetOffset || state.syncOffset) - state.syncOffset) < 0.15) {
+                const offset = Number.isFinite(state.syncOffset) ? state.syncOffset : 0;
+                setAlignStatus(`已校准: ${offset >= 0 ? '+' : ''}${offset.toFixed(2)}s`, 'ok');
+                showToast(`刚刚已校准，可继续复核`, 'ok');
+                resetAutoAlignButton();
+                return;
+            }
+            showLocalAlignGuide('校准');
+            setTimeout(() => {
+                setAlignStatus(`校准中: ±${Math.min(10, win).toFixed(1)}s`, 'warn');
+            }, 900);
+            runClassicCalibration();
         };
-        document.getElementById('rate-bar').oninput = e => { const r=parseFloat(e.target.value); master.playbackRate=slave.playbackRate=r; document.getElementById('txt-rate').textContent=r.toFixed(1)+'x'; };
+        document.getElementById('btn-live-align').onclick = e => {
+            if (!hasDual) { showToast("当前只有一路视频", 'warn'); return; }
+            state.realtimeAlign = !state.realtimeAlign;
+            e.currentTarget.classList.toggle('active', state.realtimeAlign);
+            liveAlignStable = [];
+            if (state.realtimeAlign) {
+                ensureAudioCapture();
+                showLocalAlignGuide('AUTO');
+                setTimeout(() => setAlignStatus('AUTO: 等待有声片段', ''), 1200);
+                showToast('AUTO 已开启：只做±10s局部修正', 'ok', 2800);
+                setTimeout(maybeLiveAlign, 500);
+            } else {
+                setAlignStatus('');
+                showToast('AUTO 已关闭');
+            }
+        };
+        document.getElementById('rate-bar').oninput = e => { const r=parseFloat(e.target.value); state.rate=r; applyBaseRate(); document.getElementById('txt-rate').textContent=r.toFixed(1)+'x'; };
         document.getElementById('btn-fs').onclick = () => { const r=document.getElementById('hsp-root-v20'); if(!document.fullscreenElement) r.requestFullscreen(); else document.exitFullscreen(); };
         document.getElementById('btn-help').onclick = () => document.getElementById('hsp-help').style.display = 'flex';
         document.querySelector('.btn-close-help').onclick = () => document.getElementById('hsp-help').style.display = 'none';
 
         document.addEventListener('keydown', e => {
+            if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
             if (e.code === 'Space') { e.preventDefault(); toggle(); }
-            if (e.code === 'ArrowRight') { master.currentTime += 5; showToast('快进 5s'); }
-            if (e.code === 'ArrowLeft') { master.currentTime -= 5; showToast('后退 5s'); }
+            if (e.code === 'ArrowRight') { seekBoth(master.currentTime + 5); showToast('快进 5s'); }
+            if (e.code === 'ArrowLeft') { seekBoth(master.currentTime - 5); showToast('后退 5s'); }
         });
+        runtime.current = {
+            state,
+            get masterId() { return master && master.id; },
+            get slaveId() { return slave && slave.id; },
+            get streams() { return urls.slice(); },
+            get syncOffset() { return state.syncOffset; },
+            setSync: writeSync,
+            seekBoth,
+            autoAlignNow: () => new Promise((resolve, reject) => autoAlign(v1, v2, resolve, reject)),
+            fingerprintCandidate: (opts = {}) => offlineFingerprintAlign(urls, master.currentTime, Object.assign({ maxApplyOffset: 120, windowSec: 120, searchSec: 100 }, opts)),
+            getAlignStatus: () => ({ status: state.alignStatus, last: state.lastAlign, realtime: state.realtimeAlign })
+        };
+        window.__HSP_DEBUG__ = runtime.current;
+        if (typeof unsafeWindow !== 'undefined') unsafeWindow.__HSP_DEBUG__ = runtime.current;
+        writeDebugState();
+        if (typeof unsafeWindow !== 'undefined') {
+            unsafeWindow.__HSP_CLEANUP__ = () => {
+                runtime.timers.forEach(id => clearInterval(id));
+                runtime.timers = [];
+                try { document.getElementById('hsp-root-v20')?.remove(); } catch(e) {}
+                try { audioCapture.processors.v1?.disconnect(); audioCapture.processors.v2?.disconnect(); audioCapture.sink?.disconnect(); } catch(e) {}
+                audioCapture.processors.v1 = null;
+                audioCapture.processors.v2 = null;
+                audioCapture.sink = null;
+            };
+        }
         const fmt = s => { if(!Number.isFinite(s)||s<0)return "--:--"; return new Date(s*1000).toISOString().substr(11,8); };
     }
 
