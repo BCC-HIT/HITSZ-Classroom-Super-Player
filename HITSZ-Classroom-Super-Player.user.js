@@ -9,6 +9,8 @@
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.4.0/dist/hls.min.js
 // @grant        unsafeWindow
 // @license      MIT
+// @updateURL    https://openuserjs.org/meta/BCC-HIT/HITSZ_%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8.meta.js
+// @downloadURL  https://openuserjs.org/install/BCC-HIT/HITSZ_%E8%AF%BE%E5%A0%82%E8%A7%86%E9%A2%91%E8%B6%85%E7%BA%A7%E6%92%AD%E6%94%BE%E5%99%A8.user.js
 // @run-at       document-start
 // ==/UserScript==
 
