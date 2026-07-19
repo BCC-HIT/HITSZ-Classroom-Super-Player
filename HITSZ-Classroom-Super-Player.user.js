@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HITSZ 课堂视频超级播放器
 // @namespace    http://tampermonkey.net/
-// @version      61.0
+// @version      62.0
 // @description  【仅支持 Violentmonkey 暴力猴，不支持 Tampermonkey 油猴】HITSZ 视频平台功能增强脚本。现代化UI，双流同屏，实时自动对齐，可调整大小比例，去黑边。支持两通道音量在0-500%独立调节，支持人声增强。
 // @author       BCC
 // @match        *://jxypt.hitsz.edu.cn/ve/back/rp/common/rpIndex.shtml?method=studyCourseDeatil*
@@ -70,7 +70,7 @@
         }
     } catch(e) {}
 
-    console.log("HSP V61.0 (Author: BCC): 引擎启动...");
+    console.log("HSP V62.0 (Author: BCC): 引擎启动...");
 
     function isCurrentBoot() {
         return typeof unsafeWindow === 'undefined' || unsafeWindow.__HSP_BOOT_ID__ === bootId;
@@ -113,6 +113,31 @@
         return isVideo && !isSegment;
     };
 
+    // 三路课堂录像会同时请求老师、课件和学生视角。不能依赖请求先后顺序：
+    // 学生视角可能比课件更早返回，导致它被错误地放进小窗。
+    function getStreamRole(url) {
+        let text = String(url || '');
+        try { text = decodeURIComponent(text); } catch (e) {}
+        text = text.toLowerCase();
+        if (/(?:老师|教师|teacher|lecturer|instructor|maincamera|teacherview)/i.test(text)) return 'teacher';
+        if (/(?:课件|ppt|courseware|course-?ware|slide|document|screen|presentation)/i.test(text)) return 'courseware';
+        if (/(?:学生|student|learner|studentview)/i.test(text)) return 'student';
+        return 'unknown';
+    }
+
+    function selectPlaybackStreams(urls) {
+        const streams = urls.filter(isValidStream);
+        const teacher = streams.find(url => getStreamRole(url) === 'teacher');
+        const courseware = streams.find(url => getStreamRole(url) === 'courseware');
+
+        // 主画面为老师，小窗为课件；只有两者都识别到时才覆盖旧的顺序兼容逻辑。
+        if (teacher && courseware) return [teacher, courseware];
+
+        // 即使角色信息不完整，也绝不在有其它候选时优先选学生视角。
+        const nonStudent = streams.filter(url => getStreamRole(url) !== 'student');
+        return (nonStudent.length >= 2 ? nonStudent : streams).slice(0, 2);
+    }
+
     const originalOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {
         if (isValidStream(url)) {
@@ -142,8 +167,8 @@
         launchScheduled = true; // 立刻锁住，后续XHR/fetch不再重置计时器
         launchTimer = setTimeout(() => {
             if (!isCurrentBoot()) return;
-            // 修复：严格限制最多取前两条，防止HLS子manifest被误当第二路流
-            const validList = Array.from(capturedUrls).filter(isValidStream).slice(0, 2);
+            // 三路时优先老师 + 课件，且课件作为小窗（第二路）来源。
+            const validList = selectPlaybackStreams(Array.from(capturedUrls));
             if (validList.length > 0) {
                 isPlayerLaunched = true; // 修复：在任何异步操作前先锁住，防止race condition
                 parseMetaFromUrl(validList[0]);
@@ -1434,7 +1459,7 @@ self.onmessage = function(e) {
             const el = document.getElementById('hsp-debug-state');
             if (!el) return;
             el.textContent = JSON.stringify({
-                version: '61.0',
+                version: '62.0',
                 syncOffset: state.syncOffset,
                 realtimeAlign: state.realtimeAlign,
                 alignStatus: state.alignStatus,
