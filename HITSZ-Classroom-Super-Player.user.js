@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         HITSZ 课堂视频超级播放器
 // @namespace    http://tampermonkey.net/
-// @version      62.0
+// @version      62.1
 // @description  【仅支持 Violentmonkey 暴力猴，不支持 Tampermonkey 油猴】HITSZ 视频平台功能增强脚本。现代化UI，双流同屏，实时自动对齐，可调整大小比例，去黑边。支持两通道音量在0-500%独立调节，支持人声增强。
 // @author       BCC
+// @homepageURL  https://github.com/BCCHIT/HITSZ-Classroom-Super-Player
+// @supportURL   https://github.com/BCCHIT/HITSZ-Classroom-Super-Player/issues
 // @match        *://jxypt.hitsz.edu.cn/ve/back/rp/common/rpIndex.shtml?method=studyCourseDeatil*
 // @match        *://jxypt-hitsz-edu-cn-s.hitsz.edu.cn/ve/back/rp/common/rpIndex.shtml?method=studyCourseDeatil*
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.4.0/dist/hls.min.js
@@ -70,7 +72,7 @@
         }
     } catch(e) {}
 
-    console.log("HSP V62.0 (Author: BCC): 引擎启动...");
+    console.log("HSP V62.1 (Author: BCC): 引擎启动...");
 
     function isCurrentBoot() {
         return typeof unsafeWindow === 'undefined' || unsafeWindow.__HSP_BOOT_ID__ === bootId;
